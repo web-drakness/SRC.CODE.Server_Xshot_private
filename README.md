@@ -3,8 +3,8 @@
 Discord : https://discord.gg/JUbY5vksnM ติดต่อเรา
 ## 🎬 วิดีโอตัวอย่างระบบ / Server+Login+Lobby
 <p align="center">
-  <a href="https://youtube.com" target="_blank">
-    <img src="https://youtube.com" alt="วิดีโอตัวอย่างระบบ XSHOT" width="600">
+  <a href="[https://youtube.com](https://youtu.be/zW1ByXF4XDE)" target="_blank">
+    <img src="[https://youtube.com](https://youtu.be/zW1ByXF4XDE)" alt="วิดีโอตัวอย่างระบบ XSHOT" width="600">
   </a>
 </p>
 # XSHOT Local Server
