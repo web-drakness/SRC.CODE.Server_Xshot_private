@@ -3,7 +3,7 @@
 Discord : https://discord.gg/JUbY5vksnM ติดต่อเรา
 ## 🎬 วิดีโอตัวอย่างระบบ / Server+Login+Lobby
 <p align="center">
-  <a href="https://youtu.be/zW1ByXF4XDE">
+  <a href="https://www.youtube.com/embed/zW1ByXF4XDE">
   </a>
 </p>
 # XSHOT Local Server
