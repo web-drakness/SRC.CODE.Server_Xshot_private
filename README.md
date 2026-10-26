@@ -3,7 +3,7 @@
 Discord : https://discord.gg/JUbY5vksnM ติดต่อเรา
 ## 🎬 วิดีโอตัวอย่างระบบ / Server+Login+Lobby
 <p align="center">
-  <video src="https://github.com/web-drakness/SRC.CODE.Server_Xshot_private/blob/main/test.mp4" width="600" controls>
+  <video src="test.mp4" width="600" controls>
   </video>
 </p>
 
