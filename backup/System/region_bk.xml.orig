@@ -1,0 +1,4 @@
+<RegionList>
+	<Region ip="202.151.180.191" port = "7451" state="1" type="0" usenp="0" asynload="1" usefastchek="1" CheckSHA1="1" mat_para="Netpas_Fazhi=60 -EADL -NSC -newnetlib -NetEnableRT   -C7433 -SDR -C7721 -NoFpsPerfom -GuardChangingViewPort -lbkk">S1</Region>
+</RegionList>
+<DisableCheckCode></DisableCheckCode>

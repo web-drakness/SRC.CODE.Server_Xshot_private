@@ -1,0 +1,1230 @@
+# XSHOT Local Server — README (แบบละเอียด)
+
+> โปรเจกต์ทำ **เซิร์ฟเวอร์ XSHOT (เกมยิง 2D สไตล์ CS) ให้เล่นบนเครื่องนี้**
+> โดยตัดการเชื่อมต่อออกไปยังเซิร์ฟเวอร์/บริการของทางการทุกช่องทาง
+>
+> client ที่ใช้: XSHOT ไทย v3.1.0.145 (build 145, ก่อน server ปิด)
+> เอนจิน: Unreal Engine 2 ("fox engine")
+>
+> **สถานะ: เสร็จ ~52%** — สเกล A (login + lobby) ~55% · สเกล B (เล่นเกมจริง) ~0%
+> ขอบเขตปัจจุบันตามที่สั่ง: **ทำ A ให้เสร็จก่อน แล้วค่อยไป B**
+>
+> ✅ **หัวข้อนี้แก้ปัญหาหน้าต่าง "Client has 1 files that may be problematic.
+> Suggest using repair tool." แล้ว** — ดูหัวข้อ 5 (กลไก integrity check ของ launcher)
+>
+> 🆕 **อัปเดตล่าสุด 25 ต.ค. 2026 ~15:52** — A4 ก้าวหน้าไปอีก 2 ขั้น:
+> 1. **ยืนยันข้อเท็จจริงด้วยการทดสอบอัตโนมัติ** — ถอด credential ออกจาก packet ได้จริง
+>    **35/40 capture** (account + MD5 ของรหัสผ่าน) · script ตรวจซ้ำได้ที่
+>    `tools\verify_a4_claims.py` (ดูหัวข้อ **18.1–18.3**)
+> 2. **ย้ายฐานข้อมูลไป Microsoft SQL Server** (`168.222.28.150:54855` ฐาน `xshot`) และ
+>    **ต่อ game server เข้ากับ API + ฐานข้อมูลจริงแล้ว** (ดูหัวข้อ **18.4**)
+>
+> อ่านหัวข้อ **18 (สถานะล่าสุด)** ก่อน
+> ถ้าจะทำงานต่อ ให้ดูหัวข้อ **10 (แผนงาน)** ด้วย
+
+---
+
+## 0. เริ่มใช้งานแบบเร็ว (4 คำสั่ง)
+
+```powershell
+# 1) แก้ client ให้ชี้มาที่เซิร์ฟเวอร์เรา (ปลอดภัย ทำซ้ำได้ มี backup)
+python H:\xshot\server\tools\patch_client_offline.py
+
+# 2) รันเซิร์ฟเวอร์ (HTTP patch/bootstrap :8080 + game/Bishop :7451)
+cd H:\xshot\server
+python run_server.py
+
+# 3) เปิด client
+H:\xshot\client_xshot\XSHOT.exe
+
+# 4) ดูว่า client เข้ามาหาเราหรือเปล่า
+Get-Content H:\xshot\server\logs\server.log -Wait
+```
+
+ดูผลลัพธ์:
+- log เซิร์ฟเวอร์: `H:\xshot\server\logs\server.log`
+- packet ที่ client ส่งเข้ามา: `H:\xshot\server\capture\*.bin` (ไบนารีดิบ) + `*.hex.txt` (hexdump)
+  - `*.c2s.bin` = payload ที่ตัดหัว `u16` ออกแล้ว (621 ไบต์ = login request)
+  - `*.s2c.bin` = สิ่งที่เซิร์ฟเวอร์ส่งกลับ (44 ไบต์ = handshake greeting)
+- log ของ client: `H:\xshot\client_xshot\log\mat_online_*.log.1`
+- log ของตัวเกม: `H:\xshot\client_xshot\System\Dmp_Log\Mat*.log`
+- log ของตัวซ่อมไฟล์: `H:\xshot\client_xshot\MatRepairCar.log`
+
+> 💡 **ไม่อยากกดปุ่ม Login เอง?** สคริปต์เปิด client พร้อมพิมพ์บัญชีให้เองได้
+> ```powershell
+> python H:\xshot\tools\run_login2.py --user admin --pass admin123
+> ```
+> (ต้องเปิด `run_server.py` ค้างไว้ก่อน — เกมจะต่อ 7451 แล้วส่ง packet 621 ไบต์)
+> เกมใช้ DirectInput อ่านคีย์บอร์ด → สคริปต์ใช้ `SendInput` + `KEYEVENTF_SCANCODE` จึงพิมพ์ได้
+
+ตรวจว่า client ไม่มีไฟล์เสีย (ต้องได้ "OK - every client file matches"):
+```powershell
+python H:\xshot\server\tools\verify_client_integrity.py --hash
+```
+
+> 🗄️ **ฐานข้อมูล**: ตอนนี้ใช้ **Microsoft SQL Server** ที่ `168.222.28.150:54855` (ฐาน `xshot`)
+> แก้การเชื่อมต่อได้ใน `server\config.json` หัวข้อ `db`
+> ต้องมี `pip install pymssql` ครั้งเดียวก่อนรันเซิร์ฟเวอร์
+> ตรวจการเชื่อมต่อ: `python H:\xshot\server\tools\db_selftest.py`
+
+---
+
+## 1. โครงสร้างโฟลเดอร์
+
+```
+H:\xshot\
+├─ README.md                      ← ไฟล์นี้
+├─ client_xshot\                  client เกม (แก้ให้ชี้ 127.0.0.1 แล้ว)
+│  ├─ XSHOT.exe                   launcher หลัก (17.7 MB)  ★ patch แล้ว
+│  ├─ MATRepair.exe               ตัวซ่อมไฟล์ (2.65 MB)  ★ patch แล้ว
+│  ├─ mat_version.dll             DLL ฝัง URL ของ patch server  ★ patch แล้ว
+│  ├─ local.ini                   ★ config หลักของเซิร์ฟเวอร์ที่ client ติดต่อ
+│  ├─ Download.xml                รายการแพ็คอัปเดต
+│  ├─ region.ini                  region ที่ผู้ใช้เลือกล่าสุด
+│  ├─ log\                        log ของ launcher (mat_online*.log.1, RepairEntry.xml)
+│  ├─ System\                     โฟลเดอร์เกม (engine, script, config)
+│  │  ├─ MAT.exe                  ★ ตัวเกมจริง (13.7 MB, ถูก pack)
+│  │  ├─ region_bk.xml            cache ของ region.xml (ถูก launcher เขียนทับทุกครั้ง!)
+│  │  ├─ userinfo.conf            ★ ไฟล์ที่ทำให้เกิดข้อความ "1 files may be problematic"
+│  │  ├─ KFXClientNetwork.dll     ★ transport layer (native)  ★ cipher ปิดเป็น no-op
+│  │  ├─ KFXClientNetwork2.dll    ★ net lib ตัวที่สอง (client ใช้ตัวนี้ เพราะ -newnetlib)  ★ cipher ปิดเป็น no-op
+│  │  ├─ *.u                      UnrealScript (protocol/game logic)
+│  │  └─ *.dll                    anti-cheat / engine / 3rd party
+│  ├─ Maps\  StaticMeshes\  Textures\  Sounds\  Animations\   asset ของเกม
+│  └─ Launch\Src\Res\             ไฟล์ติดตั้งต้นฉบับ (installer)
+├─ backup\                        สำเนาต้นฉบับก่อนแก้ (.orig) ← ย้อนกลับได้
+├─ server\                        ★ เซิร์ฟเวอร์ที่เราเขียน
+│  ├─ config.json                 ค่าพอร์ต/host ทั้งหมด (แก้ที่นี่ที่เดียว)
+│  ├─ run_server.py               จุดเริ่มรัน
+│  ├─ cut_legacy_connections.ps1  ตัด DNS + firewall (ต้อง Admin) — ไม่จำเป็นแล้ว
+│  ├─ repair\                     cache ของ patch server (manifest + ไฟล์ที่ proxy มา + patched.json)
+│  ├─ xshot\
+│  │  ├─ config.py                โหลด config.json
+│  │  ├─ logging_setup.py         logging
+│  │  ├─ http_bootstrap.py        ★ HTTP service (region/version/repair/clientinfo)
+│  │  ├─ patch_mirror.py          ★ mirror ของ patchxshot.winwin.co.th
+│  │  ├─ bishop.py                ★ protocol Bishop (framing / handshake / cipher / mix)
+│  │  ├─ game_server.py           ★ TCP game server + capture harness
+│  │  ├─ api.py                   ★ REST API /api/* (ผู้เล่น/ตัวละคร/session claim)
+│  │  ├─ db.py                    ★ ฐานข้อมูล (SQL Server + SQLite) accounts/characters/items/login_log
+│  │  ├─ auth.py                  ★ ตัวเรียก API จาก game server
+│  │  ├─ login_protocol.py        ★ ถอด credential จาก payload + ReplyBuilder
+│  │  └─ login_flow.py            ★ ขั้นตอน login: packet → API → session → ตอบกลับ
+│  ├─ data\xshot.db              ★ ฐานข้อมูล SQLite (ใช้ตอน backend = "sqlite")
+│  ├─ tools\
+│  │  ├─ patch_client_offline.py  ★ patcher หลัก (URL ใน .dll/.exe + config)
+│  │  ├─ record_patched.py        จำไฟล์ที่แก้ เพื่อสร้าง manifest ใหม่
+│  │  ├─ verify_client_integrity.py  ตรวจว่าไฟล์ client ตรงกับ manifest ไหม
+│  │  ├─ selftest_patch_mirror.py เทสต์ endpoint ทุกตัวของ patch mirror
+│  │  ├─ db_selftest.py           ★ เทสต์การเชื่อมต่อฐานข้อมูล + CRUD ทุกตาราง
+│  │  ├─ db_cleanup_testdata.py   ★ ลบบัญชี/ตัวละครที่ค้างจากการทดสอบ
+│  │  └─ cut_client_connections.py patcher รุ่นเก่า (ยังใช้ได้)
+│  ├─ logs\server.log             log เซิร์ฟเวอร์ของเรา
+│  └─ capture\                    packet ที่ capture ได้ (*.c2s.bin / *.s2c.bin / *.hex.txt)
+├─ tools\                         สคริปต์ RE + เครื่องมือ automation (ดูหัวข้อ 7.7)
+└─ re\                            ผลการวิเคราะห์ (strings, keystream, dumps, ไฟล์ต้นฉบับ, decrypted_all\)
+```
+
+---
+
+## 2. กายวิภาพของ client
+
+### 2.1 ไฟล์สำคัญ
+
+| ไฟล์ | ขนาด | หน้าที่ | เข้ารหัส? |
+|---|---|---|---|
+| `XSHOT.exe` | 17.7 MB | launcher (UI, login, update, spawn เกม) | บางส่วน (URL เป็น UTF-16) |
+| `MATRepair.exe` | 2.65 MB | ตัวซ่อมไฟล์ (integrity check + ดาวน์โหลดไฟล์ที่เสีย) | บางส่วน (URL เป็น UTF-16) |
+| `System\MAT.exe` | 13.7 MB | **ตัวเกมจริง** (UE2 + logic เกม) | **pack ทั้งไฟล์** (section `.text22` entropy 8.0) |
+| `System\KFXClientNetwork.dll` | 108 KB | transport layer (socket pool, tick, packet) — **cipher ปิดเป็น no-op แล้ว** | ไม่ |
+| `System\KFXClientNetwork2.dll` | 253 KB | **net lib ตัวที่ client ใช้จริง** (launcher ส่ง `-newnetlib`) — cipher ปิดเป็น no-op แล้ว | ไม่ |
+| `System\iceclientlib.dll` | 3.9 MB | ICE network middleware | บางส่วน |
+| `System\gameguard.dll` | 53 KB | anti-cheat (nProtect-like) | – |
+| `System\kavscan.dll` | 1.0 MB | anti-cheat Kingsoft | – |
+| `System\KFXProto.u` | 38 KB | **นิยาม protocol (ฝั่งส่ง)** | KFXArchive |
+| `System\KFXProtoRecieve.u` | 140 KB | **นิยาม protocol (ฝั่งรับ)** | KFXArchive |
+| `System\KFXGame.u` | 5.8 MB | logic เกม (มีทั้ง client และ server class) | KFXArchive |
+| `System\csvpkg.u` | 95 MB | asset/pak ขนาดใหญ่ | KFXArchive |
+| `System\engine.dat` | 3.4 MB | data ของ engine | KFXArchive |
+| `System\userinfo.conf` | 4024 B | ข้อมูลผู้ใช้ล่าสุด (เขียนทับตอนเข้าเกม) | KFXArchive |
+| `System\region_bk.xml` | 311 B | cache ของ region.xml — **launcher เขียนทับทุกครั้งที่เปิด** | อ่านออก |
+| `System\UnDiffer.exe` | 163 KB | เครื่องมือ diff package ของทางการ | ไม่ |
+
+ทั้งหมด **434 ไฟล์** ในโฟลเดอร์ client ถูกห่อด้วย `KFXArchive` (ดูหัวข้อ 8)
+
+### 2.2 ขั้นตอนการบูต (อ่านจาก log จริง `client_xshot\log\mat_online_*.log.1`)
+
+```
+XSHOT.exe (launcher)
+ │
+ ├─ อ่าน local.ini → [PlugInShotServer] BishopIP0/1, [HTTPDelegate] URL
+ ├─ GET http://127.0.0.1:8080/synchVS/region/region.xml   (หลัง patch)
+ │     └─ cache ลง System\region_bk.xml  (log: "download byte:320", "refresh regoin list complete")
+ ├─ HEAD + GET http://127.0.0.1:8080/synchVS/versioninfo/latest-version.xml
+ ├─ GET  http://127.0.0.1:8080/synchVS/region/UpdateFileList.xml   (SHA1 ของ .u)
+ ├─ Integrity check → ถ้าไฟล์ไม่ตรง manifest: ดาวน์โหลด MATRepair.exe แล้วซ่อม
+ └─ spawn ตัวเกม:
+      System\MAT.exe -updated -BishopIp=127.0.0.1 -BishopPort=7451
+        -Channel= -ChannelPara= -PlatformCode=0
+        -use_mat_pro=-14702 -use_np_pro=113944 -DisableRT -AsynDelayLoad
+        -OPENGAMEREPORT Netpas_Fazhi=60 -EADL -NSC -newnetlib -NetEnableRT
+        -C7433 -SDR -C7721 -NoFpsPerfom -GuardChangingViewPort -lbkk,**
+```
+
+> ⚠️ **สำคัญ**: ค่า `-BishopIp` มาจาก **region.xml ที่ดาวน์โหลดมา** ไม่ใช่จากไฟล์ในเครื่อง
+> การแก้ `System\region_bk.xml` อย่างเดียวไม่มีผล เพราะ launcher เขียนทับทุกครั้ง
+> → ต้อง intercept **region.xml** ที่มา (หัวข้อ 3)
+
+### 2.3 ตาราง log ที่ควรดู
+
+| ไฟล์ | เนื้อหา |
+|---|---|
+| `client_xshot\log\mat_online_*.log.1` | log ของ launcher: URL ที่เรียก, byte ที่ดาวน์โหลด, คำสั่ง spawn เกม, error |
+| `client_xshot\MatRepairCar.log` | log ของตัวซ่อมไฟล์: manifest ที่ดาวน์โหลด, ไฟล์ที่ "size error" |
+| `client_xshot\log\RepairEntry.xml` | manifest ที่ตัวซ่อมไฟล์แคชไว้ |
+| `client_xshot\install.log` | log ตอนติดตั้ง (NSIS) — เผยไฟล์ที่ engine เขียนกลับ |
+| `server\logs\server.log` | log เซิร์ฟเวอร์ของเรา (รวม User-Agent ของ client) |
+| `server\capture\*.hex.txt` | hexdump ทุก packet ที่ client ส่งเข้ามา |
+
+---
+
+## 3. ข้อค้นพบสำคัญ: patch server ทางการ **ยังเปิดอยู่**
+
+> README รุ่นก่อนบอกว่า "ทุกอย่างตายแล้ว" — **ผิด** สำหรับตัว patch server
+> (ตรวจซ้ำเมื่อ 2026-10-24 เวลา ~23:5x)
+
+| ปลายทาง | สถานะ | หมายเหตุ |
+|---|---|---|
+| `patchxshot.winwin.co.th` (202.151.181.1 / .3) | ✅ **ยังเปิด** | คืน HTTP 200 พร้อมเนื้อหาครบ (manifest 176,412 B, region.xml 320 B, versioninfo 3,976 B) |
+| `202.151.180.191:7451` (Bishop เกม) | ❌ ตาย | port ปิด → เกมต่อเกม server ไม่ได้ |
+| `125.39.62.93` / `121.14.11.87` (Bishop สำรอง) | ❌ ตาย | ทุกพอร์ต |
+| `118.26.237.101:21` (FTP) | ❌ ตาย | |
+| `118.26.237.105:80` (HTTP) | ❌ ตาย | |
+
+**ผลกระทบต่อแผนงาน (สำคัญ):**
+1. ถ้าปล่อยให้ launcher คุยกับ patch server ทางการ มันจะ **ดาวน์โหลด `region.xml` ตัวจริง**
+   ที่ชี้ไป `202.151.180.191` (ตาย) → เกมเล่นไม่ได้
+2. ถ้าไฟล์ใน client ถูกแก้ ตัว integrity check จะเจอว่า "เสีย" แล้วสั่งซ่อม
+   ซึ่งจะ **ดาวน์โหลดไฟล์ต้นฉบับจากทางการมาเขียนทับ patch ของเรา**
+   (เกิดจริงเมื่อ 2026-10-24 23:57 — `local.ini` ถูกเขียนกลับเป็นตัวต้นฉบับ)
+3. ดังนั้นต้อง **แทนที่ patch server ทั้งเส้น** ไม่ใช่แค่แก้ config
+
+### 3.1 endpoint ของ patch server ที่ launcher ใช้
+
+| Path | ขนาดจริง | ใช้ทำอะไร |
+|---|---|---|
+| `/synchVS/region/region.xml` | 320 B | รายการ region → ค่า `-BishopIp/-BishopPort` ที่ spawn เกม |
+| `/synchVS/region/UpdateFileList.xml` | 164,331 B | SHA1 ของไฟล์ `.u` (เกี่ยวกับ `CheckSHA1="1"`) |
+| `/synchVS/versioninfo/latest-version.xml` | 3,976 B | `<lastversionnum>3.1.0.145</lastversionnum>` + ประวัติเวอร์ชัน |
+| `/synchVS/repair/RepairEntry/RepairEntry.xml` | 176,412 B | **manifest ตรวจไฟล์ (1,542 ไฟล์)** |
+| `/synchVS/repair/RepairEntry/MatOnline/<dir>/<file>` | zlib | payload สำหรับซ่อมไฟล์ |
+| `/synchVS/repair/RepairEntry/MATRepair.exe` | 2,652,008 B | ตัวซ่อมไฟล์ |
+
+---
+
+## 4. กลไก "Client has N files that may be problematic" (หัวข้อแก้ตามภาพ)
+
+### 4.1 ไหนมาจากไหน
+
+ข้อความในภาพอยู่ใน **resource ของ `XSHOT.exe`** (UTF-16LE, offset `0x92560`):
+
+```
+Http %d
+Client has %d files that may be problematic. Suggest using repair tool.
+Integrity check in progress.
+Already latest version.
+%s\M A T R e p a i r . e x e - c a r
+```
+
+### 4.2 manifest (RepairEntry.xml) หน้าตาแบบนี้
+
+```xml
+<root>
+<filelist>
+<file compress_size=325 size=537 md5=04a4eb7991bacd465cee2f35558c82b6>local.ini</file>
+<file compress_size=3951 size=4024 md5=d2cd1842805dcf92b5f2cc4ae1a1270f>System\userinfo.conf</file>
+...
+</filelist>
+</root>
+```
+
+| attribute | ความหมาย (ยืนยันแล้วจากไฟล์จริง) |
+|---|---|
+| `size` | **ขนาดไฟล์บนดิสก์** — ตัวแก้ปัญหาเทียบกับค่านี้ |
+| `compress_size` | ขนาด payload หลังบีบอัด **zlib** (magic `78 da`) ที่เซิร์ฟเวอร์เสิร์ฟ |
+| `md5` | md5 ของไฟล์ **ก่อน** บีบอัด (ตรวจแล้ว: md5 ของไฟล์ที่ถอด zlib = md5 ใน manifest) |
+
+### 4.3 กลไกที่เกิดจริง
+
+1. launcher/ตัวซ่อมไฟล์ดาวน์โหลด `RepairEntry.xml`
+2. เทียบ **ขนาดไฟล์บนดิสก์** กับ `size` ใน manifest ทุกไฟล์
+   (log ของตัวซ่อม: `Check:<file>.size error ,local:503,web:537`)
+3. ไฟล์ที่ไม่ตรง → ขึ้น dialog "Client has N files that may be problematic"
+4. ถ้ากดใช้ตัวซ่อม → launcher ดาวน์โหลด `MATRepair.exe` แล้วรันด้วย `-car`
+5. ตัวซ่อมดาวน์โหลด payload ของไฟล์ที่เสียจาก `MatOnline/<dir>/<file>` แล้วเขียนทับ
+
+> ⚠️ จุดนี้แหละที่ทำให้ patch ของเราหาย: ถ้าเราแก้ไฟล์ใน client แล้วไม่แก้ manifest
+> ตัวซ่อมจะดึงต้นฉบับจากทางการมาทับ (เกิดจริง 2026-10-24 23:57)
+
+### 4.4 ไฟล์ที่ทำให้เกิด "1 files" ในภาพ
+
+`System\userinfo.conf` — ต้นฉบับ 4024 B แต่ในเครื่องเป็น 4048 B
+(ไฟล์นี้ถูกเกม/launcher เขียนทับตอนเข้าเกม)
+→ ดาวน์โหลดต้นฉบับมาจากทางการ: `re\pristine_System_userinfo.conf` (4024 B)
+
+### 4.5 วิธีแก้ที่ใช้จริง (ไม่ต้องใช้สิทธิ์ Admin)
+
+**แนวคิด: ทำให้เราเป็น "patch server" ตัวจริงของ client**
+
+| ไฟล์ binary | string ที่ patch | จาก | เป็น |
+|---|---|---|---|
+| `mat_version.dll` | `http://patchxshot.winwin.co.th/synchVS/versioninfo/` | ASCII @`0x1eab4` | `http://127.0.0.1:8080/synchVS/versioninfo/` |
+| `mat_version.dll` | `http://patchxshot.winwin.co.th/synchVS/repair/` | ASCII @`0x1eae8` | `http://127.0.0.1:8080/synchVS/repair/` |
+| `mat_version.dll` | `http://patchxshot.winwin.co.th/synchVS/region/` | ASCII @`0x1eb18` | `http://127.0.0.1:8080/synchVS/region/` |
+| `XSHOT.exe` | `http://patchxshot.winwin.co.th/synchVS/repair/RepairEntry/MATRepair.exe` | UTF-16 @`0x92858` | `http://127.0.0.1:8080/synchVS/repair/RepairEntry/MATRepair.exe` |
+| `XSHOT.exe` | `https://patchxshot.winwin.co.th/landing/index_new.asp` | UTF-16 @`0x91b46` | `http://127.0.0.1:8080/landing/index_new.asp` |
+| `MATRepair.exe` | `http://patchxshot.winwin.co.th/synchVS/repair/` | UTF-16 @`0x201868` | `http://127.0.0.1:8080/synchVS/repair/` |
+
+**ข้อสำคัญ: patch แบบ "คงขนาดไฟล์"** — string ใหม่สั้นกว่าเดิม จึงเติม NUL ท้ายให้ยาวเท่าเดิม
+→ ขนาดไฟล์ไม่เปลี่ยน → ไม่กระทบ manifest และ pointer ในโค้ดยังชี้ถูกตำแหน่ง
+
+> เดิม README เคยเขียนว่าแก้ DLL แล้วพังเพราะ SHA1 — จริง ๆ ปัญหาอยู่ที่
+> **manifest** ไม่ใช่ SHA1 ของ DLL (ดูหัวข้อ 4.3) แก้ได้ถ้าเราคุม manifest เอง
+
+### 4.6 ฝั่งเซิร์ฟเวอร์: `server/xshot/patch_mirror.py`
+
+หน้าที่:
+1. **cache manifest ทางการ** ไว้ที่ `server/repair/RepairEntry.xml.official` (โหลดครั้งเดียว)
+2. **สร้าง manifest ใหม่จากสถานะจริงของ client**: ไฟล์ที่เราแก้ (จาก `patched.json`)
+   จะถูกบีบ zlib + คำนวณ md5/size ของไฟล์จริงใหม่ → launcher เห็นว่า "ไฟล์ถูกต้อง"
+3. **เสิร์ฟ payload ของไฟล์ที่เราแก้** เป็น zlib ของไฟล์เวอร์ชันเราเอง
+   → ถ้าตัวซ่อมไฟล์ทำงาน มันจะ "ซ่อม" กลับมาเป็นไฟล์ที่เราแก้ ไม่ใช่ต้นฉบับ
+4. ไฟล์ที่ไม่ได้แก้ → **proxy** จาก patch server ทางการ (และ cache ลงดิสก์)
+
+ผลลัพธ์ (ยืนยันแล้ว):
+
+```
+$ python server\tools\verify_client_integrity.py --hash
+manifest entries : 1542
+files on disk    : 1542
+size mismatch    : 0
+md5 mismatch     : 0
+missing          : 0
+
+OK - every client file matches the manifest the launcher sees.
+```
+
+และเมื่อรันตัวซ่อมไฟล์จริง (`MATRepair.exe -car`) กับเซิร์ฟเวอร์เรา:
+
+```
+XML Path = http://127.0.0.1:8080/synchVS/repair/RepairEntry/RepairEntry.xml
+CurlDwonMemeEx OK ... [RCode Ret=0,val=200] ... val=174866
+url base=http://127.0.0.1:8080/synchVS/repair/
+GetNeedRepairFiles,CheckMD5 = 0
+        ← ไม่มีบรรทัด "Check:...size error" เลย = ไม่มีไฟล์เสีย
+```
+
+---
+
+## 5. รายการ endpoint ทั้งหมด + สถานะการตัด
+
+| # | Endpoint | โปรโตคอล / พอร์ต | ใช้ทำอะไร | วิธีตัด | สถานะ |
+|---|---|---|---|---|---|
+| 1 | `202.151.180.191` | TCP 7451 (Bishop) | **เกมต่อเข้าเซิร์ฟเวอร์** | `region.xml` จากเซิร์ฟเรา → `127.0.0.1` | ✅ ตัดแล้ว |
+| 2 | `125.39.62.93` | TCP (Bishop สำรอง) | เซิร์ฟเวอร์เกมสำรอง | `local.ini` → `127.0.0.1` | ✅ ตัดแล้ว |
+| 3 | `121.14.11.87` | TCP (Bishop สำรอง) | เซิร์ฟเวอร์เกมสำรอง | `local.ini` → `127.0.0.1` | ✅ ตัดแล้ว |
+| 4 | `118.26.237.101` | FTP 21 | โหลดแพ็คอัปเดต | `local.ini` → `127.0.0.1` | ✅ ตัดแล้ว |
+| 5 | `192.168.64.252` | FTP 21 | โหลดรูปหัว/อวตาร | `local.ini` → `127.0.0.1` | ✅ ตัดแล้ว |
+| 6 | `118.26.237.105` | HTTP 80 `/sss/getclientinfo.php` | **ดึงรายชื่อเซิร์ฟเวอร์** | `local.ini` → `127.0.0.1:8080` | ✅ ตัดแล้ว |
+| 7 | `118.26.237.105` | HTTP 80 `/sss/getstopinfo.php?area=` | สถานะเซิร์ฟเวอร์ | `local.ini` → `127.0.0.1:8080` | ✅ ตัดแล้ว |
+| 8 | `patchxshot.winwin.co.th` | HTTP 80 `/synchVS/region/` | **รายการ region (ต้นทางของ Bishop IP)** | patch `mat_version.dll` | ✅ ตัดแล้ว |
+| 9 | `patchxshot.winwin.co.th` | HTTP 80 `/synchVS/versioninfo/` | เช็คเวอร์ชันล่าสุด | patch `mat_version.dll` | ✅ ตัดแล้ว |
+| 10 | `patchxshot.winwin.co.th` | HTTP 80 `/synchVS/autoupdate/update*.exe` | ดาวน์โหลด patch | `Download.xml` → `127.0.0.1:8080` | ✅ ตัดแล้ว |
+| 11 | `patchxshot.winwin.co.th` | HTTP 80 `/synchVS/repair/` | ซ่อมไฟล์ที่เสีย | patch `mat_version.dll` + `XSHOT.exe` + `MATRepair.exe` | ✅ ตัดแล้ว |
+| 12 | `api.weibo.com` | HTTPS 443 | ปุ่มแชร์ Weibo | `local.ini` → `127.0.0.1:8080` | ✅ ตัดแล้ว |
+| 13 | `cu004.www.duba.net` | HTTP 80 | Kingsoft kavscan เก็บ log | hosts + firewall | ⚠️ |
+| 14 | `cloud-q.duba.net` | HTTPS | Kingsoft cloud | hosts + firewall | ⚠️ |
+| 15 | `partnerdownload.xunyou.com` | HTTP 80 | ตัวเร่งเน็ต (Xunyou) | hosts + firewall | ⚠️ |
+| 16 | `xd.jufangsoft.com` | HTTP 80 | SDK โฆษณา/สถิติ | hosts + firewall | ⚠️ |
+| 17 | `1-4825903-cpb-mbr3.cpbadvertising.com` | HTTP 80 | โฆษณา | hosts + firewall | ⚠️ |
+| 18 | `pixvue.com` | HTTP 80 | SDK รูปภาพ | hosts + firewall | ⚠️ |
+| 19 | OCSP/CRL ของทางการ | HTTPS | ตรวจใบรับรองดิจิทัล | **ไม่ตัดโดยเจตนา** | ⬜ ตามตั้งใจ |
+
+หมายเหตุ: ข้อ 8–11 เดิมต้องใช้ hosts file + สิทธิ์ Admin
+**ตอนนี้ไม่ต้องใช้แล้ว** เพราะเรา patch URL ในไบนารีแทน (หัวข้อ 4.5)
+สคริปต์ `cut_legacy_connections.ps1` ยังใช้ได้ถ้าอยากตัดที่เหลือ (13–18)
+
+---
+
+## 6. การเปลี่ยนแปลงที่ทำกับ client (ย้อนกลับได้)
+
+ต้นฉบับทั้งหมดอยู่ที่ `H:\xshot\backup\<path>.orig`
+(สร้างครั้งแรกโดย `server/tools/patch_client_offline.py`)
+
+### 6.1 `client_xshot\local.ini`
+```diff
+  [ServerSection]
+- FtpServerIP=118.26.237.101
++ FtpServerIP=127.0.0.1
+  [PlugInShotServer]
+- BishopIP0=125.39.62.93
+- BishopIP1=121.14.11.87
++ BishopIP0=127.0.0.1
++ BishopIP1=127.0.0.1
+  [HeadImageServer]
+- FtpServerIP=192.168.64.252
++ FtpServerIP=127.0.0.1
+  [WeiBoShare]
+- SWeiboEmpowerResponseAddr="https://api.weibo.com/oauth2/default.html"
++ SWeiboEmpowerResponseAddr="http://127.0.0.1:8080/weibo/oauth"
+  [HTTPDelegate]
+- ConnectBishopErroURL="http://118.26.237.105/sss/getclientinfo.php"
+- ServerStateURL="http://118.26.237.105/sss/getstopinfo.php?area="
++ ConnectBishopErroURL="http://127.0.0.1:8080/sss/getclientinfo.php"
++ ServerStateURL="http://127.0.0.1:8080/sss/getstopinfo.php?area="
+```
+
+### 6.2 ไฟล์ binary (patch แบบคงขนาด)
+| ไฟล์ | เปลี่ยน | ขนาดเดิม = ขนาดใหม่ |
+|---|---|---|
+| `mat_version.dll` | 3 base URL → `127.0.0.1:8080` | 218,112 ✔ |
+| `XSHOT.exe` | URL ดาวน์โหลด MATRepair.exe + landing page | 17,701,616 ✔ |
+| `MATRepair.exe` | base URL ของ repair server | 2,652,008 ✔ |
+
+### 6.3 `client_xshot\System\userinfo.conf`
+คืนเป็นต้นฉบับ 4024 B (จาก `re\pristine_System_userinfo.conf`) — กันไม่ให้โผล่ dialog
+
+### 6.4 `client_xshot\Download.xml`
+```diff
+- <URL>http://patchxshot.winwin.co.th/synchVS/autoupdate/update142-143.exe</URL>
++ <URL>http://127.0.0.1:8080/autoupdate/update142-143.exe</URL>
+```
+
+### 6.5 `client_xshot\System\region_bk.xml`
+ถูก launcher เขียนทับทุกครั้ง — patch ไว้เป็น fallback แต่ตัวจริงคือ region.xml จากเซิร์ฟเรา
+
+### 6.6 `client_xshot\region.ini`
+```diff
+  [last_region]
+- name=<ค่าเดิม>
++ name=S1
+```
+
+### 6.7 ไฟล์ network DLL (เพิ่ม 25 ต.ค. — **ปิด cipher ของชั้น transport**)
+
+ตอนนี้ client เลือก net lib ตัวที่สอง เพราะ launcher ส่ง `-newnetlib`
+→ DLL ที่ใช้จริงคือ **`System\KFXClientNetwork2.dll`** (259,072 B) ไม่ใช่ `KFXClientNetwork.dll`
+
+เราแพตช์ฟังก์ชันเข้ารหัสทั้งหมดให้เป็น no-op (`mov eax,1 ; ret`) เพื่อให้ payload ที่วิ่งบนสาย
+เป็น plaintext ล้วน → เซิร์ฟเวอร์ถึงจะเห็นข้อมูลตามจริงได้
+
+| ไฟล์ | ตำแหน่งที่ patch | เดิม | ใหม่ |
+|---|---|---|---|
+| `System\KFXClientNetwork.dll` | RVA `0x3C40`, `0x3C70`, `0x3CC0`, `0x3DF0`, `0x3F60` (mode 0/2/3 + md5 enc/dec ทั้งหมด) | โค้ดจริง | `B8 01 00 00 00 C3` |
+| `System\KFXClientNetwork2.dll` | RVA `0x1E220` (table cipher ตัวเดียวที่ DLL2 มี) | โค้ดจริง | `B8 01 00 00 00 C3` |
+
+ยืนยันสถานะปัจจุบัน (ตรวจจากไฟล์จริง):
+```
+KFXClientNetwork2.dll @0x1E220 : b8 01 00 00 00 c3   ← no-op แล้ว
+KFXClientNetwork2.dll.orig      : 53 56 8b f0 8b de   ← ต้นฉบับ
+```
+
+> ⚠️ ไฟล์ที่แก้ต้องแจ้งให้ patch server รู้ด้วย ไม่งั้นตัวซ่อมไฟล์จะดึงต้นฉบับมาทับ
+> → รายการไฟล์ที่แก้อยู่ใน `server\repair\patched.json` (ปัจจุบัน 10 ไฟล์) และ manifest
+> ถูกสร้างใหม่อัตโนมัติตอนเซิร์ฟเวอร์เริ่ม
+
+### 6.8 วิธีย้อนกลับ
+```powershell
+Copy-Item H:\xshot\backup\local.ini.orig          H:\xshot\client_xshot\local.ini -Force
+Copy-Item H:\xshot\backup\Download.xml.orig       H:\xshot\client_xshot\Download.xml -Force
+Copy-Item H:\xshot\backup\mat_version.dll.orig    H:\xshot\client_xshot\mat_version.dll -Force
+Copy-Item H:\xshot\backup\XSHOT.exe.orig          H:\xshot\client_xshot\XSHOT.exe -Force
+Copy-Item H:\xshot\backup\MATRepair.exe.orig      H:\xshot\client_xshot\MATRepair.exe -Force
+Copy-Item H:\xshot\backup\KFXClientNetwork.dll.orig  H:\xshot\client_xshot\System\KFXClientNetwork.dll -Force
+Copy-Item H:\xshot\backup\KFXClientNetwork2.dll.orig H:\xshot\client_xshot\System\KFXClientNetwork2.dll -Force
+Copy-Item H:\xshot\backup\System\userinfo.conf.orig H:\xshot\client_xshot\System\userinfo.conf -Force
+Copy-Item H:\xshot\backup\System\region_bk.xml.orig H:\xshot\client_xshot\System\region_bk.xml -Force
+powershell -ExecutionPolicy Bypass -File H:\xshot\server\cut_legacy_connections.ps1 -Undo
+```
+
+### 6.9 ตรวจว่าไม่มีการต่อออกไปข้างนอก
+```powershell
+Get-NetTCPConnection -State Established | Where-Object RemoteAddress -ne '127.0.0.1' |
+  Select-Object LocalPort,RemoteAddress,RemotePort,OwningProcess
+```
+
+---
+
+## 7. โค้ดเซิร์ฟเวอร์
+
+### 7.1 `server/config.json`
+```json
+{
+  "bind_host": "127.0.0.1",
+  "game": {
+    "host": "127.0.0.1", "port": 7451, "region": "S1", "server_name": "XSHOT-Local",
+    "mode": "bishop",          // capture | relay | mitm | bishop
+    "bishop_mode": 2,          // cipher mode 0/1/2/3 (ดูหัวข้อ 9/16)
+    "cipher": "none",          // none = client ถูก patch ให้ไม่เข้ารหัส → payload คือ plaintext
+    "upstream": "202.151.180.191:7451",
+    "greeting_a": "0x57",      // A ใน handshake → mix(A) = 0 → key ฝั่ง client = 0
+    "greeting_b": "0x57"
+  },
+  "http": { "host": "127.0.0.1", "port": 8080, "client_version": "3.1.0.145" },
+  "db": {
+    "backend": "mssql",            // sqlite | mssql
+    "server": "168.222.28.150",
+    "port": 54855,
+    "user": "mcadmin",
+    "password": "Rew256911",
+    "database": "xshot",
+    "charset": "UTF-8",
+    "timeout": 30,
+    "login_timeout": 15,
+    "path": "H:\\xshot\\server\\data\\xshot.db",   // ใช้ตอน backend = "sqlite"
+    "seed": true,
+    "seed_account": "admin",
+    "seed_password": "admin123",
+    "seed_character": "Newbie"
+  },
+  "auth": {
+    "api_base": "http://127.0.0.1:8080",
+    "timeout": 10.0,
+    "auto_register": true
+  },
+  "patch": {
+    "client_dir": "H:\\xshot\\client_xshot",
+    "cache_dir": "H:\\xshot\\server\\repair",
+    "official_base": "http://patchxshot.winwin.co.th/synchVS",
+    "proxy_official": true,
+    "manifest_mode": "local"
+  }
+}
+```
+`manifest_mode`: `"local"` = สร้าง manifest จากไฟล์จริง (ปกติ) / `"official"` = ส่ง manifest ทางการเปล่า ๆ (ใช้ debug)
+`game.mode`: `capture` (แค่บันทึก) · `relay` (ส่งต่อไป upstream) · `mitm` (ถอด + ส่งต่อ) · **`bishop` (ตอบเอง ใช้ตอนนี้)**
+`game.cipher`: `"none"` = เชื่อว่า client ถูก patch ให้ไม่เข้ารหัสแล้ว / `"auto"` = ลองถอดทุกโหมดแล้วเลือกอันที่ดูเป็น plaintext ที่สุด
+`greeting_a`/`greeting_b`: ค่า A/B ที่ส่งไปกับ handshake — **ตั้งเป็น `0x57` เพราะ `mix(0x57) = 0`
+→ key ที่ client ใช้เข้ารหัส/ถอดรหัสเป็นศูนย์** (ดูหัวข้อ 16.2)
+
+### 7.2 `server/xshot/http_bootstrap.py`
+| endpoint | ตอบอะไร |
+|---|---|
+| `/synchVS/region/region.xml` | `<Region ip="127.0.0.1" port="7451" ...>S1</Region>` (คัดลอกรูปแบบทางการทุกตัวอักษร) |
+| `/synchVS/region/UpdateFileList.xml` | cache จากทางการ (SHA1 ของ `.u`) |
+| `/synchVS/versioninfo/latest-version.xml` | cache จากทางการ (3.1.0.145) |
+| `/synchVS/repair/RepairEntry/RepairEntry.xml` | manifest ที่คำนวณจาก client จริง |
+| `/synchVS/repair/RepairEntry/MatOnline/<dir>/<file>` | payload zlib (ของเรา หรือ proxy จากทางการ) |
+| `/synchVS/repair/RepairEntry/MATRepair.exe` | ตัวซ่อมไฟล์จากโฟลเดอร์ client (ตัวที่เรา patch แล้ว) |
+| `/sss/getclientinfo.php` | JSON `{result, area, servers[]}` |
+| `/sss/getstopinfo.php?area=` | JSON `{result, area, state}` |
+| `/autoupdate/*` | 404 (ไม่ต้องอัปเดต) |
+| `/weibo/*` | `{}` |
+
+รองรับทั้ง `GET` และ `HEAD` (launcher ยิง HEAD ด้วย — ถ้าไม่รองรับจะวน retry ไม่จบ)
+
+### 7.3 `server/xshot/patch_mirror.py`
+| method | หน้าที่ |
+|---|---|
+| `prepare()` | ดาวน์โหลด/โหลด manifest ทางการ + อ่าน `patched.json` |
+| `rescan()` | เทียบขนาดไฟล์บนดิสก์กับ manifest → รู้ว่าไฟล์ไหนเราแก้ |
+| `manifest_bytes()` | สร้าง manifest ใหม่ (ไฟล์ที่เราแก้ → size/md5 ของไฟล์จริง + payload zlib ของเรา) |
+| `repair_file(path)` | เสิร์ฟ payload ของไฟล์หนึ่ง (เรา หรือ proxy จากทางการ + cache) |
+| `static_document(name, rel)` | เอกสาร static (versioninfo, UpdateFileList) + cache |
+
+### 7.4 `server/xshot/game_server.py`
+- `Capture` — บันทึกทุก byte ที่ client ส่งมา ลง `capture\<ts>-<peer>.bin` + `.hex.txt`
+  (แยก `.c2s.bin` = client→server และ `.s2c.bin` = server→client)
+- `FramingAnalyzer` — เดา framing จาก byte stream
+- `GameServer._client_loop` — รับจนกว่า client จะปิด หรือ idle 30 วินาที
+- `GameServer._bishop_loop` — โหมดที่ใช้จริงตอนนี้: ส่ง handshake greeting 44 ไบต์
+  แล้วอ่านเฟรมด้วย `bishop.parse_frames`
+- `GameServer._decode` — ถอด payload ด้วย cipher ทุกโหมด แล้วเลือกอันที่ "ดูเป็นข้อมูลมีโครงสร้าง" ที่สุด
+- **`GameServer._handle_bishop_frame` ← จุดที่จะเขียน logic ตอบกลับ** (ตอนนี้ยังว่าง = จุดติดหลัก)
+- `GameServer._login_flow` — สร้าง `LoginFlow` (ถ้ามี `db` ใน config) เพื่อเชื่อม game server
+  → REST API → ฐานข้อมูล
+
+### 7.4b `server/xshot/api.py` + `db.py` + `auth.py` + `login_flow.py` + `login_protocol.py` (25 ต.ค. 14:35)
+โมดูลชุดใหม่ที่ทำให้ "ล็อกอินจริง" มีที่เก็บข้อมูลและมีเส้นทางตรวจสอบที่ชัดเจน
+(scalable ไปยังสเกล B ได้เลย โดยไม่ต้องรื้อฝั่ง client)
+
+| ไฟล์ | หน้าที่ |
+|---|---|
+| `db.py` | ฐานข้อมูลผู้เล่น — รองรับ 2 แบ็กเอนด์: **Microsoft SQL Server** (ค่าเริ่มต้นตอนนี้, ผ่าน `pymssql`) และ **SQLite** (ไฟล์เดียวในเครื่อง) — ตาราง `accounts`, `characters`, `character_items`, `character_stats`, `login_log`, `sessions` · รหัสผ่านเก็บแบบ PBKDF2-HMAC-SHA256 200,000 รอบ + salt ต่อบัญชี (และเก็บ MD5 ของรหัสผ่านไว้ด้วย เพราะ client ส่งมาแบบนั้น) · thread-safe (connection ต่อ thread) · **ทดสอบ CRUD ผ่านหมด** (`server\tools\db_selftest.py`) |
+| `api.py` | REST API JSON ใต้ `/api/` — `health`, `auth/register`, `auth/login`, `auth/logout`, `accounts`, `account/<a>` (+`password`, `status`, `characters`), `characters`, `character/<name>` (+`items`), `logs/login`, `session/claim` |
+| `auth.py` | `AuthClient` — ตัวเรียก API จากฝั่ง game server ผ่าน HTTP (เกม server ไม่เขียน SQL เอง → มีจุดเดียวที่ข้อมูลไหล) |
+| `login_protocol.py` | `Credentials` dataclass + ตัว decoder credential จาก payload (`decode_login`) + **`ReplyBuilder`** = จุดเสียบ (seam) สำหรับสร้าง packet ตอบ `M2C_*` ที่ยังไม่รู้รูปแบบ |
+| `login_flow.py` | `LoginFlow` — ขั้นตอน "client กด Login → ถอด credential → ตรวจกับ API → เก็บ session → สร้าง packet ตอบ" |
+
+> ช่องทางข้อมูลตอนนี้: `client → game server (Bishop :7451) → /api/auth/login → SQL Server (168.222.28.150:54855/xshot)`
+
+#### 7.4b-1 ฐานข้อมูล Microsoft SQL Server (25 ต.ค. 15:15)
+
+`db.py` เขียนใหม่เป็น 3 ชั้น:
+
+| ชั้น | หน้าที่ |
+|---|---|
+| `DatabaseBase` | business logic ทั้งหมด (authenticate, ตัวละคร, ของ, สถิติ, session) — SQL เขียนแบบ portable ใช้ `?` เป็น placeholder |
+| `SqliteDatabase` | override เฉพาะ SQLite — schema, placeholder, `LIMIT ?` |
+| `MsSqlDatabase` | override เฉพาะ SQL Server — schema (`dbo.*`, `NVARCHAR`, `IDENTITY`), placeholder แปลง `?` → `%s`, `OFFSET 0 ROWS FETCH NEXT ? ROWS ONLY` |
+| `create_database(cfg)` | เลือกแบ็กเอนด์จาก `config.json` → `cfg["db"]["backend"]` (`sqlite` \| `mssql`) |
+
+จุดที่ต่างระหว่างสองแบ็กเอนด์:
+- **schema**: SQLite ใช้ `TEXT`/`REAL`/`INTEGER` + `AUTOINCREMENT` · SQL Server ใช้ `NVARCHAR`/`FLOAT`/`INT IDENTITY`
+- **upsert**: SQLite ใช้ `ON CONFLICT ... DO UPDATE` แต่ SQL Server ไม่มี → โค้ดใช้ "UPDATE ก่อน ถ้าไม่ทำงานค่อย INSERT" (ทำงานได้ทั้งสองฝั่ง)
+- **ข้อความภาษาไทย**: SQL Server ใช้ `NVARCHAR` → ข้อความไทยเข้า-ออกถูกต้อง (SQLite เก็บเป็น UTF-8)
+- **FK**: SQL Server ใช้ `ON DELETE CASCADE` เหมือนกัน (ลบตัวละคร → ของและสถิติที่ผูกหายเอง)
+
+ติดตั้งไลบรารี (ครั้งเดียว):
+```powershell
+pip install pymssql
+```
+
+ทดสอบการเชื่อมต่อ + CRUD ทุกตาราง:
+```powershell
+python H:\xshot\server\tools\db_selftest.py
+```
+
+ลบบัญชี/ตัวละครที่ค้างจากการทดสอบ:
+```powershell
+python H:\xshot\server\tools\db_cleanup_testdata.py
+```
+> ระหว่างที่ยังถอด credential จาก packet ของ client ไม่ได้ มี `/api/session/claim` เป็น
+> **สะพานชั่วคราว** (TTL 120 วินาที) ให้เครื่องมือภายนอกยืนยัน credential ให้ก่อน
+> เมื่อถอด packet ได้จริง กลไกนี้จะไม่ถูกใช้อีก
+
+### 7.5 `server/xshot/bishop.py` (โมดูล protocol — 25 ต.ค.)
+ยึดมาจาก disassembly ของ `KFXClientNetwork.dll` / `KFXClientNetwork2.dll` (ไม่ถูก pack)
+
+| ฟังก์ชัน | หน้าที่ |
+|---|---|
+| `build_greeting(a, b)` | สร้าง payload handshake 42 ไบต์ (`20 00 ...`) ที่มีค่า A/B ฝังไว้ |
+| `frame(payload)` | ห่อ payload ด้วยหัว `u16 LE` (นับหัวรวม) |
+| `parse_frames(buf)` | แยกเฟรม → `(payload, consumed)` + leftover |
+| `mix(x)` | สูตร derive key: `~((x^6d23cf)-6d2399)` + byte จาก `0x2e6d23cf` + `0xffffffcf` |
+| `TableCipher` | mode 0 — ตาราง 5,679 รายการ (`TABLE_RVA = 0x100C8` ใน DLL1, `0x36FE0` ใน DLL2) |
+| `XorCipher` | mode 2 (XOR dword) / mode 3 (XOR dword + state `state*0x1F + 0x08088405`) |
+| `UnsupportedCipher` | mode 1 (MD5 keystream) — **ยังไม่ implement** |
+| `load_table()` | อ่านตารางจาก `.rdata` ของ DLL ด้วย pefile |
+| `BishopSession` | state ต่อ session: inbound = `decrypt(mix(A))`, outbound = `encrypt(mix(B))` |
+
+### 7.6 เครื่องมือช่วยตรวจ
+```powershell
+# patch client (ทำซ้ำได้ ปลอดภัย มี backup)
+python H:\xshot\server\tools\patch_client_offline.py
+
+# เทสต์ทุก endpoint ของ patch mirror
+python H:\xshot\server\tools\selftest_patch_mirror.py
+
+# ตรวจว่าไฟล์ client ตรงกับ manifest ที่ launcher เห็น (ใส่ --hash เพื่อเช็ค md5 ด้วย)
+python H:\xshot\server\tools\verify_client_integrity.py --hash
+
+# เปิด client + พิมพ์บัญชี + กด Login ให้อัตโนมัติ
+python H:\xshot\tools\run_login2.py --user admin --pass admin123
+
+# ปิด cipher ใน client (ทำให้ payload เป็น plaintext)
+python H:\xshot\tools\patch_no_cipher2.py
+```
+
+### 7.7 เครื่องมือ RE ที่ใช้บ่อย (`H:\xshot\tools\`)
+| ไฟล์ | หน้าที่ |
+|---|---|
+| `ui_type2.py` | พิมพ์บัญชี/คลิกในหน้าต่างเกม (SendInput + scancode, เพราะ UE2 ใช้ DirectInput) |
+| `run_login2.py` | เปิด client → พิมพ์บัญชี → กด Login → รอไฟล์ capture ใหม่ |
+| `list_windows.py`, `focus_probe.py`, `shot.ps1` | หา handle/class name ของหน้าต่างเกม + ถ่ายภาพหน้าจอ |
+| `decode_capture.py`, `crack_cipher.py`, `brute_cipher.py`, `brute_table.py`, `brute_table_state2.py` | ถอด payload ที่ capture มา ด้วยทุกโหมด/ทุก key |
+| `cmp_last3.py`, `diff_caps.py`, `diff_runs.py` | เทียบ payload ของหลายรอบ เพื่อหาว่า field ไหนเปลี่ยนตามบัญชี |
+| `exp_matrix.py`, `exp_key.py`, `exp_account.py` | ทดลอง 2×2 (บัญชี × รหัส) เพื่อแยก field ใน payload |
+| `dll2_*.py`, `dll1_*.py`, `disasm_rva.py`, `find_in_dll.py` | ถอดโค้ด DLL เป็น C ตาม RVA ที่ต้องการ |
+| `ue2pkg.py`, `ue2_names.py`, `ue2_classes.py` | อ่าน name table ของแพ็คเกจ UE2 (`.u`) ที่ถอดแล้ว |
+| `NativeCipher.cs/.exe`, `NativeMode1.cs/.exe`, `NativeMix3.cs/.exe` | เรียกฟังก์ชันเข้ารหัสของ DLL โดยตรง (32-bit) เพื่อยืนยันผล ไม่ต้องเดาเอง |
+| `modlist.py`, `mem_check.py`, `dump_ctx.py` | อ่าน memory ของ `MAT.exe` (โมดูลที่โหลด, cipher ใน memory) |
+
+---
+
+## 8. KFXArchive — container format (reverse engineering เชิงลึก)
+
+### 8.1 โครงสร้าง
+```
+offset 0x00 : "KFXArchive"        (10 bytes, ASCII)
+offset 0x0A : payload             (ciphertext)
+```
+- ใช้กับ **ทุกไฟล์ใน client** (434 ไฟล์): `.u`, `.utx`, `.usx`, `.ut2`, `.smt`, `.ini`, `.dat`, `.conf`
+- `System\UnDiffer.exe` (เครื่องมือของทางการ) อ่าน header นี้แล้วข้ามไป 10 ไบต์
+  (`UnDiffer.exe` offset `0x403c42`: `fread(buf,10)` → `memcmp(buf,"KFXArchive",10)` → `size -= 10`)
+
+### 8.2 ✅ SOLVED: `cipher[i] = plain[i] ^ KS[i % 1024]` (keystream 1024 ไบต์)
+**keystream ยาว 1024 ไบต์ พบแล้ว** — ไม่ต้อง RE โค้ดตัวเกม ไม่ต้องถอด packer ไม่ต้องทำ memory dump
+
+| หัวข้อ | ผล |
+|---|---|
+| **ที่มาของ key** | `System\gameguard.dll` offset `0xA020` — 29 ไบต์แรกตรงกับ crib ที่ได้จาก UE2 magic |
+| **key ที่เหลือ (byte 29..1023)** | derive ด้วย maximum likelihood จาก corpus `.ini` 34 ไฟล์ (`tools/ks_derive3.py`) |
+| **period** | **1024 ไบต์** (ไม่ใช่ 256 — เดิมวิเคราะห์ผิด) |
+| **ไฟล์เก็บ key** | `H:\xshot\re\keystream_1024_full.bin` + ฝังใน `tools/kfx_key.py` |
+| **เครื่องมือถอด** | `tools/decrypt_all.py` → ผลลัพธ์ทั้งหมดที่ `H:\xshot\re\decrypted_all\` (1,221 ไฟล์) |
+
+**หลักฐานว่า period = 1024 (ไม่ใช่ 256):**
+1. `.ini` ถอดด้วย key 256 ไบต์ **ถูกต้องถึง byte ~255 แล้วพัง** → period > 256
+2. ลายนิ้วมือ `KS[0:8]` ใน `csvpkg.u` (95 MB) ปรากฏที่ payload offset ≡ 0 (mod 1024) **เท่านั้น**
+   (รวมถึง k ที่คี่ → period ต้องหาร 1024) → period ∈ {512, 1024}
+3. `KS[12:28]` ปรากฏที่ offset ≡ 12 (mod 1024) ยืนยัน phase alignment
+4. ใน `KFXProto.u` ชื่อ protocol อ่านออกที่ offset `0x400` (= 1024) และ `0x41D` (= 1024+29)
+
+**หลักฐานความถูกต้องของ key:**
+| ไฟล์ | ผลการตรวจ |
+|---|---|
+| `.ini` 34 ไฟล์ | decode เป็น **GB18030 ได้ 0% error** (ไฟล์ config เป็นจีน) |
+| `System\userinfo.conf` | decode เป็น **UTF-16LE ได้ 0% error** |
+| `System\KFXProto.u` | UE2 tag = `0x9E2A83C1` ถูกต้อง, อ่านชื่อ message ได้ครบ |
+| `System\Core.u` | UE2 tag = `0x9E2A83C1` ถูกต้อง |
+
+> **หมายเหตุสำคัญ:** เกมนี้เป็น **XSHOT ไทย** — `userinfo.conf` มี section `[chatmacro]` เป็นภาษาไทย
+> (เช่น `key0=เร็วเข้า! รีบจบเกมแล้วไปดื่มส...`)
+
+### 8.3 สิ่งที่เคยคิดว่าเป็นแต่ตอนนี้ตกไป (ข้อมูลเก่า)
+| ข้อสันฐานเดิม | สถานะจริง |
+|---|---|
+| "keystream เป็น PRNG stream ยาวไม่จำกัด" | ❌ ผิด — เป็น keystream คงที่ period 1024 ที่เก็บใน `gameguard.dll` |
+| "period ไม่ใช่ key ที่ซ้ำ (0.0137 ≈ สุ่ม)" | ❌ ผิด — การทดสอบเดิมใช้ key 256 ไบต์ (คนละ phase) |
+| "ต้องทำ memory dump ของ MAT.exe" | ❌ ไม่จำเป็นแล้ว |
+| "ต้องถอด packer 'MAT protect' ของ MAT.exe" | ❌ ไม่จำเป็นแล้ว |
+| "434 ไฟล์ถูกห่อ" | ❌ จริง ๆ คือ **1,221 ไฟล์** |
+
+### 8.4 สิ่งที่ได้จากการถอดไฟล์
+- `re/decrypted_all/` — plaintext ครบทุกไฟล์ + `_manifest.tsv` (path, cipher len, plain len, md5)
+- `System/KFXProto.u` — **นิยาม packet ฝั่ง client** (154 ชื่อ message `C2M_*`/`M2C_*`)
+- `System/KFXProtoRecieve.u` — ฝั่ง server + controller (เช่น `KFXClientLoginController`, `LoginController`,
+  `m_sLoginGatewayInfo`, `GetSyncServerTime`)
+- `System/Mat.ini` — โครงสร้างเกม (`EXEName=MAT.exe`, `Port=7777`, `Class=KFXPawns.KFXPawn`, `Character=L4`)
+- รายชื่อ message ทั้งหมด → `re/protocol_messages.txt`
+
+### 8.5 ทำไมถึงสำคัญ
+`KFXProto.u` + `KFXProtoRecieve.u` คือ **นิยาม packet ทั้งหมด** (message id, โครงสร้างฟิลด์,
+ลำดับการส่ง) ถ้าถอดได้ เราจะรู้ว่า client ส่งอะไรตอน login, server ต้องตอบอะไรกลับ
+
+---
+
+## 9. Transport layer — สิ่งที่รู้แล้ว
+
+### 9.1 `System\KFXClientNetwork.dll` (108 KB, native, ไม่ถูก pack)
+**Export:** `CreateSocketStreamPool()`, `TickNet(float DeltaTime)`
+**Import จาก `WS2_32.dll`:** `socket, connect, send, recv, select, setsockopt, gethostbyname, htons, closesocket, WSAStartup`
+→ ต่อ TCP ตรง ๆ (ไม่ผ่าน proxy) และมีโหมด non-blocking + select
+
+**ไฟล์ต้นฉบับที่ string อ้างอิงใน binary:**
+```
+e:\fox\engine\core\inc\...\KG_Socket.cpp
+KFXClientSocketStream.cpp / KG_SecuritySocketStream.cpp
+KFXClientNetwork.cpp / KFXServer.cpp / KFXServerPlayerController.cpp
+```
+→ **client มีโค้ดฝั่ง server อยู่ในตัว**
+
+### 9.2 Security key handshake
+พบ string `_RecvSecurityKey` ใน `KFXClientNetwork.dll` และชื่อคลาส `KG_SecuritySocketStream`
+→ ก่อนข้อมูลปกติ มีการตกลง **security key**
+
+### 9.3 ✅ framing จริง (ยืนยันจาก disassembly 25 ต.ค.)
+```
+[u16 LE "total"][payload ...]      ← total นับหัว 2 ไบต์รวมด้วย
+```
+- `KG_SocketStream::Send` (0x10002b60) เขียน `u16 = payload_size + 2` ไว้ที่ `data_ptr - 2`
+- `KG_SocketStream::Recv` (0x10002c70) อ่าน `u16` ก่อน แล้วอ่าน payload อีก `length - 2` ไบต์
+- ของจริงจาก Bishop ทางการ: 44 ไบต์ (`u16 = 0x002C`) → payload 42 ไบต์
+
+### 9.4 ✅ handshake (ยืนยัน 25 ต.ค.)
+- client รอ payload 42 ไบต์ที่ `payload[0..1] == 20 00` (ฟังก์ชัน `_RecvSecurityKey`)
+- key material: `A = u32le(payload[8..11])`, `B = u32le(payload[0x11..0x14])`
+- client: outbound = `encrypt(mix(A))`, inbound = `decrypt(mix(B))`
+- server: inbound = `decrypt(mix(A))`, outbound = `encrypt(mix(B))`
+- **เคล็ดลับที่ทำให้คุม transport ได้**: `mix(0x57) = 0` → ตั้ง A = B = 0x57 ใน greeting
+  แล้ว client จะเข้ารหัส/ถอดรหัสด้วย key = 0 (ดู `bishop.py`)
+
+### 9.5 สิ่งที่ยังไม่รู้
+- รูปแบบ message ของชั้นแอป (login/auth) — ยังถอดไม่ได้ (ดูหัวข้อ 17)
+- sequence number / heartbeat
+- โครงสร้าง packet ฝั่ง server ที่ต้องตอบกลับ (`M2C_*` / `PlayerLoginBishopResult`)
+
+---
+
+## 10. แผนงานที่เหลือ — ทำตามลำดับนี้
+
+### ✅ A0 · ทำให้ launcher ใช้เซิร์ฟเวอร์เรา (เสร็จแล้ว)
+1. patch `mat_version.dll` + `XSHOT.exe` + `MATRepair.exe` ให้ชี้ `127.0.0.1:8080`
+2. เพิ่ม `patch_mirror.py` ที่เลียนแบบ patch server (manifest + payload + region + version)
+3. ทำให้ manifest สะท้อนไฟล์จริง → ไม่มี dialog "files may be problematic"
+4. ผลตรวจ: 1542/1542 ไฟล์ตรง manifest (size+md5), ตัวซ่อมไฟล์ไม่พบไฟล์เสีย
+
+### ✅ A1 · ให้เกมต่อเข้าเซิร์ฟเวอร์เราได้จริง (เสร็จแล้ว — 25 ต.ค.)
+1. รัน `python run_server.py` → HTTP :8080 + Bishop :7451
+2. launcher ดาวน์โหลด `region.xml` จากเรา → `System\region_bk.xml` เป็น `ip="127.0.0.1" port="7451"`
+3. log ของ launcher ยืนยัน: `OnBtnStartGame ... -BishopIp=127.0.0.1 -BishopPort=7451`
+4. เกมต่อ TCP 7451 สำเร็จ → server ส่ง greeting 44 ไบต์กลับ → client ส่ง login request 621 ไบต์
+5. เพิ่ม `tools\run_login2.py` เพื่อเปิด client + พิมพ์บัญชี + กด Login ให้อัตโนมัติ
+
+### ✅ A2 · ถอดหา framing + handshake (เสร็จแล้ว — 25 ต.ค.)
+1. framing = `u16 LE total` (นับหัวรวม) → `bishop.parse_frames()`
+2. handshake = payload 42 ไบต์, A/B ฝังที่ offset 8 และ 0x11 → `bishop.build_greeting()`
+3. สูตร derive key = `mix()` → `bishop.mix()`
+4. cipher 4 โหมด (0 = ตาราง 5,679 / 1 = MD5 / 2 = XOR / 3 = XOR+state) → `bishop.make_cipher()`
+5. เคล็ดลับ: `mix(0x57) = 0` → ส่ง A = B = 0x57 แล้ว client ใช้ key = 0
+
+### ✅ A3 · ถอด keystream → อ่าน `KFXProto.u` (เสร็จแล้ว — 24 ต.ค.)
+1. keystream period **1024 ไบต์** เก็บใน `gameguard.dll` → `re\keystream_1024_full.bin`
+2. `tools\decrypt_all.py` ถอดได้ 1,221 ไฟล์ → `re\decrypted_all\`
+3. อ่านได้ชื่อ message/field ทั้งหมด (`sAccount`, `strPwdMD5`, `nCookie`, `LoginBishop` …)
+4. ยืนยันซ้ำวันนี้: `KFXProto.u` decrypt แล้วได้ UE2 tag `C1 83 2A 9E` ถูกต้อง ✅
+
+### 🔶 A4 · Login / server list (ถอด plaintext ของ request ได้แล้ว — ยังตอบกลับไม่ได้)
+1. ✅ client ส่ง login request มาแล้ว (621 ไบต์) — เก็บใน `server\capture\*.c2s.bin`
+2. ✅ **กู้ keystream K บางส่วนได้แล้ว** (25 ต.ค. บ่าย) — พิสูจน์ว่า payload = plaintext XOR K
+   โดย K **คงที่ต่อค่า A/B ของ handshake** และเปลี่ยนเมื่อเปลี่ยน A/B
+   (หัวข้อ 18.1–18.2) · `re\keystream_621.bin` (ได้ 48 ไบต์แรก)
+3. ✅ **รู้โครงสร้าง plaintext แล้ว** — offset 5 = account (16 ไบต์), offset 37 = MD5 ของรหัสผ่าน
+   เป็นตัวอักษรใหญ่ 32 ตัว (หัวข้อ 18.3)
+4. ✅ **มี REST API + ฐานข้อมูล Microsoft SQL Server + login flow แล้ว** —
+   `server\xshot\api.py`, `db.py`, `auth.py`, `login_flow.py`, `login_protocol.py`
+   (หัวข้อ 18.4) · CRUD ผ่านหมดทุกตาราง
+5. ❌ ยัง **กู้ keystream ทั้ง 621 ไบต์ไม่ได้** → ถอด payload ของ client ที่เข้ารหัสต่างจาก
+   K ที่รู้ยังไม่ครบ → ยังต้องใช้ `/api/session/claim` เป็นสะพานชั่วคราว
+   (แต่ถอด credential ของ 35/40 capture ได้แล้ว — หัวข้อ 18.3)
+6. ❌ ยังไม่รู้ message id / โครงสร้างฝั่ง server ที่ต้องตอบ (`PlayerLoginBishopResult`)
+   → `login_protocol.ReplyBuilder` เป็นจุดเสียบ (seam) รอใส่ logic (หัวข้อ 18.5)
+
+### ⬜ A5 · Lobby / ข้อมูลห้อง
+1. ตอบ packet รายชื่อห้อง (`KFXGUISelectServerPage`, `KFXLoginInRoleOrderInfo`)
+2. ให้ client เข้า lobby ได้และเห็นชื่อห้อง/ผู้เล่น
+
+### B1–B3 · เกมจริง (หลังจาก A เสร็จ)
+- B1 โหลดแมป + วัตถุ + ตัวละคร (30%)
+- B2 replicate state ของผู้เล่น/กระสัน/HP (40%)
+- B3 ระบบต่อสู้ + รางวัล + การจัดอันดับ (30%)
+
+---
+
+## 11. ปัญหาที่อาจเจอ + วิธีแก้
+
+| อาการ | สาเหตุที่เป็นไปได้ | วิธีแก้ |
+|---|---|---|
+| **ขึ้น dialog "Client has N files that may be problematic"** | ขนาดไฟล์ใน client ไม่ตรง manifest | รัน `patch_client_offline.py` (เขียน `patched.json` ให้ตรง) + `verify_client_integrity.py` |
+| ตัวซ่อมไฟล์ดาวน์โหลดจากทางการ | `MATRepair.exe` ยังไม่ถูก patch | รัน `patch_client_offline.py` ใหม่ |
+| ไฟล์ที่เราแก้ถูกเขียนทับกลับเป็นต้นฉบับ | manifest ไม่ได้สร้างจากไฟล์จริง | ตรวจ `server\repair\patched.json` + `RepairEntry.xml` |
+| เกมยังต่อไป IP ทางการ | `region.xml` ยังมาจากทางการ | ดู log ว่า `region.xml` มาจาก `127.0.0.1:8080` |
+| launcher วน retry ไม่จบ | server ไม่รองรับ `HEAD` | เพิ่ม `do_HEAD` (มีอยู่แล้วใน `http_bootstrap.py`) |
+| Client เปิดแล้วค้างที่ "กำลังอัปเดต" | เช็คเวอร์ชันไม่ผ่าน | `latest-version.xml` ต้องเป็น `3.1.0.145` |
+| เกมเปิดแล้วปิดทันที | anti-cheat / SHA1 check | ดู `client_xshot\log\*.log.1` หา "SHA1"/"guard"/"kav" |
+| เกมค้างหลังต่อ 7451 | server ยังไม่ตอบอะไร | ปกติในสถานะปัจจุบัน — client จะรอ ~50 วินาทีแล้วปิดเอง (`CloseBishopConnection`) |
+| โปรแกรมเซิร์ฟเวอร์ขึ้น `Address already in use` | port 7451/8080 ถูกใช้ | `netstat -ano | findstr :7451` แล้ว kill process |
+| `ModuleNotFoundError: No module named 'pymssql'` | ยังไม่ได้ติดตั้งไลบรารีของ SQL Server | `pip install pymssql` |
+| เชื่อม SQL Server ไม่ได้ (`Login failed` / `Cannot connect`) | เครื่อง/พอร์ต/สิทธิ์ | ทดสอบด้วย `python H:\xshot\server\tools\db_selftest.py` · เช็ค `Test-NetConnection 168.222.28.150 -Port 54855` |
+| แพ็กเกจ `pefile`/`capstone` ไม่มี | ใช้สคริปต์ RE | `pip install pefile capstone` |
+
+---
+
+## 12. ศัพท์เทคนิค (ไทย ↔ อังกฤษ)
+
+| คำ | ความหมาย |
+|---|---|
+| **Bishop** | ชื่อที่ทางการใช้เรียก "game server" (port 7451) ใน log/ini |
+| **KFXArchive** | container ห่อไฟล์เกมของ XSHOT (XOR + PRNG keystream) |
+| **keystream** | ลำดับ byte ที่ใช้ XOR กับ plaintext เพื่อเข้ารหัส |
+| **framing** | โครงสร้าง packet (ขนาด/ชนิด/ลำดับของ field) |
+| **handshake** | ขั้นตอน "จับมือ" ก่อนส่งข้อมูลจริง (เช่น security key) |
+| **BishopIP0/1** | key ใน `local.ini` ที่เกมใช้เลือก game server |
+| **region** | กลุ่มเซิร์ฟเวอร์/เขต (เช่น `S1`) ใน `region.xml` |
+| **manifest (RepairEntry.xml)** | รายการไฟล์ client ทั้ง 1,542 ไฟล์ + size/md5 ที่ใช้ตรวจความถูกต้อง |
+| **integrity check** | การตรวจไฟล์ client ตอนเปิดโปรแกรม (แหล่งที่มาของ dialog) |
+| **MATRepair.exe** | ตัวซ่อมไฟล์ของทางการ (รันด้วย `-car`) |
+| **UnrealScript / .u** | ภาษา script ของ UE2 เก็บ logic และโครงสร้าง packet |
+| **UE2 / fox engine** | เอนจินของเกม (unrealengine2) |
+| **MAT.exe** | ตัวเกมจริง (ไม่ใช่ launcher) |
+
+---
+
+## 13. ประวัติการเปลี่ยนแปลง
+
+| วันที่ | อะไรทำ |
+|---|---|
+| 2026-10-24 (เช้า) | สำรวจ client, หา endpoint ทั้งหมด, วิเคราะห์ KFXArchive/XOR keystream, ตัดการเชื่อมต่อระดับ config, สร้างโครงเซิร์ฟเวอร์ (HTTP bootstrap + game server + capture) |
+| 2026-10-24 (ดึก) | **พบว่า patch server ทางการยังเปิดอยู่** → ค้นพบกลไก integrity check/manifest, เขียน `patch_mirror.py` (mirror patch server), patch `mat_version.dll` + `XSHOT.exe` + `MATRepair.exe` (URL → 127.0.0.1:8080, คงขนาดไฟล์), คืน `userinfo.conf` ต้นฉบับ, เพิ่ม `verify_client_integrity.py` (1542/1542 ตรง), แก้ README |
+| 2026-10-25 (เช้า) | ถอด cipher ของ `KFXClientNetwork.dll` ออกมาได้เกือบครบ (mode 0/2/3 + key schedule) → เขียน `server/xshot/bishop.py`, แก้ `mix()` ให้ถูก, ได้ traffic จริงจาก client แล้ว (621 ไบต์) |
+| 2026-10-25 (เที่ยง) | ทำ automation เปิด client + พิมพ์บัญชี + กด Login (`tools/ui_type2.py`, `tools/run_login2.py`), เขียนเครื่องมือถอด/เทียบ payload กว่า 40 ตัว, ทดลองตาราง 5,679 รายการ brute-force state แล้วไม่ได้ plaintext |
+| 2026-10-25 (บ่าย) | พบว่า client ใช้ net lib ตัวที่สอง (`-newnetlib` → `KFXClientNetwork2.dll`) → patch cipher ใน DLL1+DLL2 เป็น no-op, เซิร์ฟเวอร์ตั้ง `cipher: none` + greeting A=B=0x57, วน capture หลายรอบเพื่อหาตำแหน่ง field ที่เปลี่ยนตามบัญชี, อัปเดต README |
+| 2026-10-25 (บ่าย 13:15–14:35) | **ก้าวหน้าใหญ่ของ A4**: พิสูจน์ว่า payload login = plaintext XOR keystream K ที่ **คงที่ต่อค่า A/B ของ handshake** (ทดลองเปลี่ยน A/B แล้ว K เปลี่ยนตาม) → กู้ K ได้ 48 ไบต์ (`re\keystream_621.bin`) และ **รู้โครงสร้าง plaintext**: offset 5 = account, offset 37 = MD5 ของรหัสผ่านเป็นตัวอักษรใหญ่ 32 ตัว → สแกน DLL ทั้งหมดใน client หา cipher ตัวที่ยังทำงาน, ยืนยันว่า table cipher 5679 รายการ **ไม่ใช่** ตัวที่เข้ารหัส payload → เขียน **REST API + SQLite (`db.py`, `api.py`, `auth.py`, `login_flow.py`, `login_protocol.py`)** เพื่อรองรับ login จริง |
+| 2026-10-25 (บ่าย 15:00–15:20) | **ย้ายฐานข้อมูลไป Microsoft SQL Server** (`168.222.28.150:54855`, ฐาน `xshot`, user `mcadmin`) → รื้อ `db.py` เป็น 3 ชั้น (`DatabaseBase` + `SqliteDatabase` + `MsSqlDatabase`) + `create_database(cfg)` เลือกแบ็กเอนด์จาก config, ติดตั้ง `pymssql`, สร้าง schema 6 ตาราง (`dbo.*`, `NVARCHAR`, `IDENTITY`, FK `ON DELETE CASCADE`) บนเครื่อง SQL Server, แก้ `run_server.py` ให้สร้าง DB + API + seed จริง (ก่อนหน้านี้ยังไม่เคย instantiate), ทดสอบ CRUD ครบทุกตารางผ่าน `/api/*` ทั้งหมด |
+| 2026-10-25 (บ่าย 15:20–15:52) | **ยืนยันข้อเท็จจริงของ A4 ด้วยการทดสอบอัตโนมัติ** → เขียน `tools\verify_a4_claims.py` ตรวจ 40 capture ทั้งหมด: ถอด credential ได้ **35/40** (account ที่ offset 5 + `MD5UPPER(password)` ที่ offset 37 ตรงกับรหัสผ่านจริงทุกชุด) และยืนยันว่า 5 รอบที่ถอดไม่ได้คือ handshake ที่ A/B ≠ `0x57` (K คนละชุด) → เพิ่ม `tools\db_cleanup_testdata.py`, รัน `db_selftest.py` ผ่านทั้งหมด, เขียน **หัวข้อ 18** ลง README (ยังไม่เคยมีในไฟล์) และอัปเดตหัวข้อ 0/10/13/14 ให้ตรงกับสถานะจริง |
+
+---
+
+## 14. สถานะงานและเปอร์เซ็นต์
+
+### 14.1 สรุป
+```
+สเกล A (login + lobby)          ███████████░░░░░░░░░░░░  55%
+สเกล B (เล่นเกมจริง)            ░░░░░░░░░░░░░░░░░░░░░░░░   0%
+─────────────────────────────────────────────────────────────
+รวมทั้งโปรเจกต์                  ███████████░░░░░░░░░░░░  52%
+```
+
+### 14.2 แจกแจงตาม workstream
+
+| Workstream | น้ำหนัก | เสร็จ | เหลือ | สถานะ |
+|---|---|---|---|---|
+| สำรวจ client + หา endpoint | 10% | 100% | 0% | ✅ เสร็จ |
+| ตัดการเชื่อมต่อ (config) | 12% | 100% | 0% | ✅ `local.ini`, `Download.xml`, `region_bk.xml` |
+| ตัดการเชื่อมต่อ (binary URL) | 8% | 100% | 0% | ✅ `mat_version.dll`, `XSHOT.exe`, `MATRepair.exe` |
+| ตัดการเชื่อมต่อ (DNS + firewall) | 8% | 40% | 60% | ⚠️ ไม่จำเป็นแล้ว (เหลือของทางการอีก 13–18) |
+| HTTP bootstrap + patch mirror | 12% | 100% | 0% | ✅ เสิร์ฟ patch server ครบทุก endpoint |
+| ถอด KFXArchive → `KFXProto.u` | 15% | 100% | 0% | ✅ keystream period 1024, ถอดได้ 1,221 ไฟล์ |
+| Transport framing + handshake | 13% | 90% | 10% | ✅ framing `u16 LE` + greeting 42 B + cipher 4 โหมด (เหลือ mode 1) |
+| Login/auth + server list | 15% | 50% | 50% | 🔶 ถอด credential จาก packet ได้จริง (35/40 capture) + API/SQL Server/login flow พร้อมแล้ว · ยังตอบ client ไม่ได้ |
+| Lobby + รายชื่อห้อง | 15% | 0% | 100% | ⬜ |
+| **สเกล B** — โหลดแมป/ตัวละคร | 30%* | 0% | 100% | ⬜ (*น้ำหนักของ B) |
+| **สเกล B** — replicate state | 40%* | 0% | 100% | ⬜ |
+| **สเกล B** — ต่อสู้/รางวัล | 30%* | 0% | 100% | ⬜ |
+
+### 14.3 งานที่ทำเสร็จไปแล้ว (สรุป)
+- ✅ สำรวจ client ทั้ง 434 ไฟล์, หา endpoint ทั้งหมด 19 จุด
+- ✅ วิเคราะห์ `KFXArchive`: ยืนยัน XOR keystream ทั้งระบบ, `k[0]=0x6E`, ไม่มี period, LCG 8-bit ไม่ผ่าน
+- ✅ ตัดการเชื่อมต่อระดับ config พร้อม backup (`H:\xshot\backup\`)
+- ✅ เขียน HTTP bootstrap (`region.xml`, `latest-version.xml`, `getclientinfo.php`, `getstopinfo.php`)
+- ✅ เขียน TCP game server + capture harness + framing analyzer
+- ✅ **ค้นพบกลไก integrity check ของ launcher (manifest + zlib payload)**
+- ✅ **เขียน `patch_mirror.py` — เลียนแบบ patch server ทางการให้ครบทุก endpoint**
+- ✅ **patch binary URL ของ `mat_version.dll` / `XSHOT.exe` / `MATRepair.exe` โดยไม่ต้องใช้ Admin**
+- ✅ **แก้ปัญหา dialog "Client has 1 files that may be problematic"**
+  (ตรวจแล้ว 1542/1542 ไฟล์ตรง manifest ทั้ง size และ md5; ตัวซ่อมไฟล์ไม่พบไฟล์เสีย)
+- ✅ **ถอด Bishop protocol จาก disassembly** — framing, handshake, `mix()`, cipher 4 โหมด
+  → `server/xshot/bishop.py` (เซิร์ฟเวอร์ตอบ handshake เองได้)
+- ✅ **client ต่อเข้าเซิร์ฟเวอร์เราและส่ง login request จริง** (621 ไบต์, เก็บทุกครั้งใน `capture\`)
+- ✅ **ปิด cipher ชั้น transport ใน client** (patch DLL1 + DLL2 เป็น no-op) → payload ที่ capture ได้คือข้อมูลดิบจากแอป
+- ✅ **automation พิมพ์บัญชีลงหน้าต่างเกมได้** (DirectInput → `SendInput` + scancode)
+- ✅ **พิสูจน์ว่า payload ของ login = plaintext XOR keystream K ที่คงที่ต่อ A/B ของ handshake**
+  (เปลี่ยน A/B แล้ว K เปลี่ยนตาม — ทดลองด้วย `tools\exp_ab_key.py`)
+- ✅ **กู้ K ได้ 48 ไบต์** (`re\keystream_621.bin`) และ **รู้โครงสร้าง plaintext**:
+  offset 5 = account, offset 37 = MD5 ของรหัสผ่าน (ตัวอักษรใหญ่ 32 ตัว)
+- ✅ **ยืนยันด้วยการทดสอบอัตโนมัติ 40 capture** — ถอด credential ได้ 35 รอบ
+  (`python tools\verify_a4_claims.py` → หัวข้อ 18.3) · 5 รอบที่ถอดไม่ได้คือ handshake
+  ที่ A/B ≠ 0x57 ตามที่คาดไว้
+- ✅ **สร้าง REST API + ฐานข้อมูล** (`api.py`, `db.py`, `auth.py`, `login_flow.py`,
+  `login_protocol.py`) พร้อมต่อเข้ากับ game server แล้ว
+- ✅ **ย้ายฐานข้อมูลไป Microsoft SQL Server** (`168.222.28.150:54855` ฐาน `xshot`)
+  — `db.py` รองรับ 2 แบ็กเอนด์ (mssql/sqlite) · CRUD ทุกตารางผ่านหมด
+  (`python server\tools\db_selftest.py`)
+- ✅ **ตัดแล้วว่า table cipher 5,679 รายการไม่ใช่ตัวที่เข้ารหัส payload**
+  (brute-force state ครบทุกตัว × ทุก DLL ใน client แล้วไม่ตรงกับ K)
+
+### 14.4 สิ่งที่ทำได้ทันที
+1. ✅ ยืนยันว่า pipeline ทั้งหมดทำงาน: launcher → patch server ของเรา → `region.xml`
+   → spawn เกม → ต่อ 7451 → handshake → login request
+2. ✅ **ฝั่งเซิร์ฟเวอร์ของ login พร้อมใช้จริงแล้ว** — REST API + SQL Server + session
+   ทำงานครบทุกตาราง และ game server ดึง credential จาก packet ไปตรวจกับ API ได้
+3. ⏭ งานถัดไปคือ **กู้ keystream K ทั้ง 621 ไบต์** + **หารูปแบบ `M2C` ที่ server ต้องตอบ**
+   แล้วเขียน `ReplyBuilder` ให้ตอบ login สำเร็จ (หัวข้อ 18.5)
+   — ระหว่างนี้ใช้ `/api/session/claim` เป็นสะพานชั่วคราว
+4. หลังจากนั้น: หน้าเลือกเซิร์ฟเวอร์ → lobby (A5) → ค่อยไปสเกล B
+
+---
+
+## 15. สิ่งที่ต้องการจากผู้ใช้
+
+1. ~~เปิด `XSHOT.exe` 1 ครั้งหลังรัน `run_server.py` แล้วบอกว่าเกมต่อ 7451 ไหม~~
+   → **ทำไปแล้วและผ่าน** (ดูหัวข้อ 17)
+2. **บัญชี XSHOT ที่เล่นได้จริง** (ยังไม่ต้องใช้ตอนนี้ แต่ต้องมีตอนทำ A4 เต็มรูปแบบ)
+   เพราะตอนนี้ server เรายังไม่รู้ว่า "ล็อกอินสำเร็จ" หน้าตาเป็นยังไง
+3. **server pack / ไฟล์ `.u` ฝั่ง server / dump จากเครื่องอื่น** — ถ้ามี งานสเกล B จะลดได้มาก
+4. **เครื่อง/บัญชีที่ยังเข้าเกมทางการได้** → ใช้ capture traffic จริงของ Bishop ทางการ
+   (ตอนนี้ Bishop ทางการตายแล้ว ถ้าไม่มี traffic จริง เราต้องถอดจากตัว client ล้วน)
+5. สิทธิ์ **Administrator** (ถ้าจะตัด DNS/firewall ของ endpoint ที่เหลือ 13–18 — ไม่จำเป็นสำหรับแก้ dialog)
+
+
+---
+
+
+---
+
+## 16. สรุปผลการทำงาน (25 ต.ค. 2026 07:00–08:00)
+
+> 📌 **หัวข้อนี้เป็นบันทึกสถานะ ณ เวลา 07:00–08:00 ของวันที่ 25 ต.ค.**
+> สถานะล่าสุด (หลังทำต่ออีก ~5 ชั่วโมง) อยู่ที่ **หัวข้อ 17** — จุดติดปัจจุบันคือ 17.3
+
+### 16.1 สิ่งที่ทำสำเร็จ
+
+1. **เครื่องมือควบคุมหน้าต่างล็อกอินของเกม** — `tools/ui_type2.py`
+   - `keybd_event` ใช้ไม่ได้ เพราะ UE2 อ่านคีย์บอร์ดผ่าน DirectInput (ไม่เห็น synthetic message)
+   - `SendInput` + `KEYEVENTF_SCANCODE` ใช้ได้จริง — พิมพ์ account/password ลงฟอร์มได้
+   - `tools/shot.ps1` / `tools/list_windows.py` / `tools/focus_probe.py` — ถ่ายภาพหน้าต่างเกม และหา class name
+     (เปลี่ยนทุกครั้งตาม build เช่น `MatUn97realWWindowsViewportWindow`)
+2. **ได้ traffic จริงจาก client แล้ว** — client ต่อ `127.0.0.1:7451` แล้วส่ง frame 623 ไบต์
+   (ต้องกดปุ่ม Login เอง — ทำแทนผู้ใช้ได้ด้วยเครื่องมือข้างบน)
+3. **ถอด cipher ของ `KFXClientNetwork.dll` ออกมาได้เกือบครบ** — ดู 16.2
+4. **แก้ `mix()` ใน `server/xshot/bishop.py`** — เดิมผิด (เอา byte ไปไว้ที่ low byte) ทำให้ key ผิดทั้งหมด
+
+### 16.2 ข้อเท็จจริงของโปรโตคอลที่ยืนยันแล้ว (จาก disassembly + รันโค้ดของ DLL เอง)
+
+| หัวข้อ | รายละเอียด |
+|---|---|
+| Framing | `u16 LE total` (นับหัวด้วย) + payload — server ทางการส่ง greeting 44 ไบต์ |
+| Greeting | payload 42 ไบต์: `20 00 63 02 6b 00 68 44` + `A` + `d7b13cf8` + `23` + `B` + `00` + `900bd9b1…` + `0a000000` + `04000000` |
+| A / B | `A = u32le(payload[8..11])`, `B = u32le(payload[0x11..14])` — ค่าคงที่ของ server ทางการ: A=0x5c64d980, B=0x4c25b00a (เปลี่ยนตามเวลาในบางช่วง) |
+| `mix()` | `~((x^6d23cf)-6d2399) & 0xffff00` + byte จาก `0x2e6d23cf` (shr 24) และ `0xffffffcf` (shl 24) **ทั้งคู่ไปอยู่ที่ top byte** → low byte = 0 |
+| โหมด cipher | mode0 = table (RVA 0x3c40), mode1 = MD5 keystream (0x3df0/0x3f60), mode2 = XOR dword (0x3cc0), mode3 = XOR dword + state (0x3c70) — jump table ที่ 0x10002a48 |
+| mode0 (table) | idx = (key ก่อนหน้า + เลขบล็อก) % 5679, key = table[idx] + 0x2E6D23C1; ตาราง 5679 อันที่ RVA 0x100c8, divisor 5679 ที่ RVA 0x15984 |
+| mode1 | key schedule = MD5(key string) → NOT → สลับ byte → XOR keystream 16 ไบต์ (0x10004b40 = MD5, 0x10003d00 = generator, 0x10003d50 = XOR) |
+| state ของ client | encrypt ใช้ `field_0xc` = mix(A), decrypt ใช้ `field_0x10` = mix(B) |
+| โหมดที่ client เลือก | เป็นค่าที่ **app layer** ส่งเข้ามา (ไม่ได้มาจาก greeting) — greeting 42 ไบต์ → mode 0/2/3, greeting 32 ไบต์ → mode 1 |
+
+### 16.3 สิ่งที่ยังต้องทำต่อ (จุดติดขัด)
+
+> ⚠️ รายการนี้เป็นของ ณ 08:00 — **อัปเดตแล้วในหัวข้อ 17.3–17.4** (ตอนนี้ปิด cipher ใน client แล้ว
+> และ payload ที่ capture ได้เปลี่ยนไปตามนั้น แต่ยังถอดไม่ออกอยู่ดี)
+
+- payload 621 ไบต์ที่ client ส่งมา **ถอดไม่ออกด้วย mode 0/2/3** (ตรวจแล้วด้วยโค้ดของ DLL เอง ไม่ใช่แค่การเดา)
+- **ยืนยันแล้วว่าการเข้ารหัสขึ้นกับ session key** — เอา capture สองครั้ง (login เหมือนกัน แต่ A/B ของ server ทางการเปลี่ยนไป)
+  มา XOR กัน ผลออกมาเป็น noise สุ่ม ไม่ใช่ศูนย์ → key มาจาก greeting ไม่ใช่จาก account/password
+- **mode 1 (MD5 keystream)** คือคำตอบที่เป็นไปได้มากที่สุด — ใช้ signature จริงคือ
+  `int cipher1(uint len, void* data, void* keyobj)` และ `keyobj[0]` เป็น `char*` ของ key string
+  (`tools/NativeMode1.exe` ใช้งานได้แล้ว — ผลต่างกันตาม key ที่ใส่ แต่ยังไม่เจอค่าที่ถอดเป็น plaintext)
+- ขั้นตอนถัดไป (เลือกทางใดทางหนึ่ง):
+  1. หา key string ที่ app layer ส่งเข้า DLL — ไล่ดู native binding ใน `.u` (KFXClient.u / KFXProto.u)
+     หรือ hook ตาราง `%x`/`k` ที่ DLL ใช้ประกอบ key
+  2. ถอดโค้ด mode 1 ให้ครบ (0x10003d00 + 0x10004b40 MD5 + การสลับ byte) แล้ว implement ใน Python
+     เพื่อไม่ต้องพึ่ง DLL
+  3. ตรวจว่า “GetOldPlayerPWDMD5” ใน KFXGUI.u ชี้ว่า client ส่ง **MD5 ของรหัสผ่าน** (ไม่ใช่รหัสจริง)
+     → เตรียม plaintext ที่คาดหวังไว้ใช้ตรวจผลลัพธ์ได้
+- เมื่อถอดได้ → เขียน server ตอบ login request + server list ให้ client เดินต่อได้
+
+### 16.4 เครื่องมือที่เพิ่มในรอบนี้
+
+| ไฟล์ | หน้าที่ |
+|---|---|
+| `tools/ui_type2.py` | พิมพ์/คลิกในหน้าล็อกอินของเกม (SendInput + scancode) |
+| `tools/shot.ps1`, `tools/list_windows.py`, `tools/focus_probe.py` | ถ่ายภาพหน้าต่างเกม / หา handle / ยึด focus |
+| `tools/decode_capture.py`, `tools/crack_cipher.py`, `tools/brute_cipher.py`, `tools/brute_table.py` | ถอด payload ที่ capture มา ด้วยทุกโหมด/ทุก key |
+| `tools/period_probe.py`, `tools/blob_probe.py`, `tools/verify_cipher.py` | ตรวจหา pattern/compression ของ payload |
+| `tools/NativeCipher.cs` → `NativeCipher.exe` (32-bit) | **เรียกฟังก์ชันเข้ารหัสของ DLL โดยตรง** เพื่อยืนยันผล (ไม่ต้องเดาเอง) |
+| `tools/NativeMode1.cs` → `NativeMode1.exe` (32-bit) | เรียก cipher mode 1 ของ DLL โดยตรง (ยังต้องหา key string) |
+| `tools/disasm_rva.py`, `tools/find_in_dll.py` | ถอดโค้ด DLL เป็นภาษา C ตาม RVA ที่ต้องการ |
+
+---
+
+## 17. สถานะล่าสุด (อัปเดต 25 ต.ค. 2026 ~13:15) — ถึงไหน / เหลืออะไร / ติดอะไร
+
+> ⚠️ **หัวข้อนี้เป็นบันทึกของเวลา 13:15 — ถูกแทนที่แล้วโดยหัวข้อ 18 (อัปเดต ~15:52)**
+> ค่าตัวเลข/เปอร์เซ็นต์ในหัวข้อนี้เป็นของ ณ 13:15 **ไม่ใช่สถานะปัจจุบัน** เก็บไว้ให้ดูย้อนหลังเท่านั้น
+> สิ่งที่เปลี่ยนไปหลังจากนี้:
+> - ✅ ถอด credential จาก packet ได้จริง **35/40 capture** (หัวข้อ 18.3)
+> - ✅ ฐานข้อมูลย้ายไป **Microsoft SQL Server** + REST API / login flow ทำงานจริง (หัวข้อ 18.4)
+> - ❌ **ยังตอบกลับ client ไม่ได้** เหมือนเดิม — จุดติดยังเป็นที่เดิม (หัวข้อ 18.5)
+>
+> → อ่านหัวข้อ **18** แทน
+
+### 17.1 ถึงไหนแล้ว (ทำเสร็จ)
+
+| ขั้นตอน | สถานะ | หลักฐาน |
+|---|---|---|
+| launcher ชี้มาที่เรา (ทั้ง config และ URL ในไบนารี) | ✅ | `region_bk.xml` = `ip="127.0.0.1" port="7451"`, log มี `-BishopIp=127.0.0.1` |
+| ไม่มี dialog "files may be problematic" | ✅ | manifest 1,542 ไฟล์ตรงทุกตัว (size+md5), ตัวซ่อมไฟล์ไม่พบไฟล์เสีย |
+| เกมต่อเข้าเราได้ | ✅ | `server.log` → `connection #N from 127.0.0.1:xxxxx` |
+| เซิร์ฟเวอร์ตอบ handshake เองได้ | ✅ | ส่ง greeting 44 ไบต์ → client ไม่ hang |
+| framing + key derivation ถอดจาก DLL | ✅ | `bishop.py` — `u16 LE total`, greeting 42 B, `mix()` |
+| client ส่ง login request มาแล้ว | ✅ | `capture\*.c2s.bin` = 621 ไบต์ (ทุกครั้งที่กด Login) |
+| ปิด cipher ชั้น transport ของ client | ✅ | DLL1 (5 จุด) + DLL2 (RVA 0x1E220) → `mov eax,1 ; ret` |
+| keystream ของไฟล์เกม | ✅ | period 1024, ถอดได้ 1,221 ไฟล์, UE2 tag ถูกต้อง |
+| automation พิมพ์บัญชี + กด Login | ✅ | `tools\run_login2.py` (SendInput + scancode) |
+
+### 17.2 เหลืออะไร (เรียงตามลำดับที่ควรทำ)
+
+1. **A4 — ถอด login request 621 ไบต์** (ขั้นตอนเดียวที่ขาด)
+   จนกว่าจะรู้ว่า payload นี้คืออะไร เราจะเขียน `_handle_bishop_frame()` ไม่ได้เลย
+2. **A4b — ตอบ login สำเร็จ** ให้ client เดินไปหน้าเลือกเซิร์ฟเวอร์ (`KFXGUISelectServerPage`)
+3. **A5 — lobby + รายชื่อห้อง/ผู้เล่น**
+4. **B1–B3 — เกมจริง** (โหลดแมป, replicate state, ระบบต่อสู้) — ยังไม่เริ่ม
+5. **งานค้างที่เล็กน้อย** — ตัด DNS/firewall ของ endpoint ข้างเคียง (13–18) ยังไม่ครบ
+   (ไม่กระทบการเล่น เพราะ patch ด้วย URL ในไบนารีแทนแล้ว)
+
+### 17.3 ติดตรงไหน (รายละเอียดจุดติด)
+
+**อาการ**: client กด Login → ส่ง payload 621 ไบต์ → server เงียบ → ประมาณ 50 วินาที
+client ปิดเอง (`[wp]:::CloseBishopConnection` ใน `System\Dmp_Log\Mat*.log`)
+
+**รู้แล้ว**:
+- payload นี้ **ไม่ใช่ noise ธรรมดา**: ถ้าใช้บัญชีเดิม ทุกรอบจะได้ body เกือบเดิมเป๊ะ
+  (ต่างกันราว 44–81 ไบต์จาก 621 ไบต์ กระจายอยู่ที่ช่วงต้น ~byte 5–42 และช่วงท้าย ~byte 550–578)
+  → แปลว่า **มี field ที่คงที่** และ **มี field ที่เปลี่ยนตาม session** ชัดเจน
+  (สอดคล้องกับ `InitSignData` / `nCookie` ที่พบใน `KFXClient.u`)
+- ใน payload **ไม่มี** account/password/MD5 เป็น ASCII หรือ hex
+  (เช็คแล้ว: ไม่มี `admin`, `admin123`, md5/sha1 ของมัน) → ยังเป็น ciphertext/encoded
+
+**ที่ลองแล้วและไม่ได้ผล**:
+| วิธี | ผล |
+|---|---|
+| ถอดด้วย cipher mode 0/2/3 ของ DLL (key จาก A/B ของ greeting) | ไม่มี plaintext |
+| brute-force state ของ table cipher ทั้ง 5,679 ค่า (ทั้งตาราง DLL1 และ DLL2) | score สูงสุด 0.29 = noise |
+| สมมติว่า cipher ยังทำงานอยู่ → patch DLL1+DLL2 เป็น no-op | payload เปลี่ยนรูปแบบแต่ยังถอดไม่ออก |
+| เดาเนื้อหาแบบ known-plaintext (crib) จากชื่อ field ที่รู้ | ยังไม่ได้ plaintext ที่สมเหตุสมผล |
+
+**ข้อสันฐานที่ยังต้องพิสูจน์** (เรียงตามความน่าเชื่อถือ):
+1. **ชั้นแอป (UnrealScript) เข้ารหัสเองอีกชั้น** — `KFXClient.u` มีฟังก์ชัน `LoginBishop`
+   ที่น่าจะเรียก crypto ของชั้นแอปก่อนส่งลง transport
+   (มีหลักฐาน: `InitSignData`, `GetOldPlayerPWDMD5`, `alreadyMd5Pwd`, `nCookie` ฯลฯ)
+2. **payload ถูกบีบอัด + เข้ารหัสด้วย key ที่คงที่** (ไม่ใช่ session key) — เพราะ body เดิมทุกรอบ
+3. **payload เป็นโครงสร้าง binary ของ UE2/KFX ที่ดูเป็น noise เฉย ๆ** (มี field เป็น hash/obfuscation)
+
+### 17.4 ทางที่ควรลองต่อ (เรียงตามความคุ้มค่า)
+
+| # | ทำอะไร | ที่อยู่ในเครื่อง | คาดว่าจะได้ |
+|---|---|---|---|
+| 1 | หาโค้ด `LoginBishop` ใน `KFXClient.u` (ถอดแล้ว) แล้วดูว่ามันแพ็ก packet ยังไง/เข้ารหัสยังไง | `re\decrypted_all\System\KFXClient.u` | เห็นลำดับ field + จุดที่เข้ารหัส |
+| 2 | หาโค้ดฝั่ง server ที่จะตอบ: `PlayerLoginBishopResult`, `KFXClientLoginController`, `m_sLoginGatewayInfo` | `re\decrypted_all\System\KFXClient.u`, `KFXProtoRecieve.u` | รู้ว่าต้องตอบ message อะไร |
+| 3 | ใช้ `tools\ue2pkg.py` / `ue2_names.py` ดึง name table + export table ของ `KFXClient.u` | `tools\ue2pkg.py` | ได้ชื่อฟังก์ชัน/ตัวแปรพร้อม offset |
+| 4 | ดู log ของแอปตอนกด Login (`Dmp_Log\Mat*.log`) ว่ามัน log payload/field อะไรบ้าง | `client_xshot\System\Dmp_Log\` | อาจมี plaintext หลุดออกมา |
+| 5 | ทำ 2×2 matrix (บัญชี × รหัส) แล้ว XOR payload สองชุด → หาช่วงไบต์ที่เปลี่ยน | `tools\exp_matrix.py`, `cmp_last3.py` | รู้ตำแหน่ง field ของบัญชี/รหัส |
+| 6 | hook ใน memory ตอน client ส่ง packet (เขียน DLL 32-bit เล็ก ๆ หรือ patch `send`) | `tools\modlist.py`, `dump_ctx.py` | ได้ payload ก่อนเข้ารหัส (ทางลัดที่สุด) |
+
+### 17.5 สถานะแต่ละสเกล (สรุปสั้น ๆ)
+
+```
+สเกล A (login + lobby)   █████████░░░░░░░░░░░░  45%   ← ติดที่ A4 (ถอด login request)
+  ├ A0 launcher → เรา        ✅ 100%
+  ├ A1 เกมต่อเซิร์ฟเวอร์เรา   ✅ 100%
+  ├ A2 framing + handshake     ✅ 100%
+  ├ A3 keystream + โค้ดเกม      ✅ 100%
+  ├ A4 login + server list     🔶  15%   ← จุดติด
+  └ A5 lobby + รายชื่อห้อง      ⬜   0%
+สเกล B (เล่นเกมจริง)     ░░░░░░░░░░░░░░░░░░░░░░░░   0%
+  ├ B1 โหลดแมป/วัตถุ/ตัวละคร      ⬜
+  ├ B2 replicate state           ⬜
+  └ B3 ต่อสู้/รางวัล/อันดับ        ⬜
+```
+
+---
+
+## 18. สถานะล่าสุด (อัปเดต 25 ต.ค. 2026 ~15:52) — ถอด credential จาก packet ได้แล้ว
+
+> หัวข้อนี้แทนที่หัวข้อ 17 (หัวข้อ 17 เก็บไว้เป็นบันทึก ณ 13:15 ให้ดูย้อนหลัง)
+> เนื้อหาคือ 2 เรื่อง: **(18.1–18.3)** ข้อเท็จจริงที่พิสูจน์แล้วว่า packet ของ login พูดอะไร
+> และ **(18.4)** โครงสร้างฝั่งเซิร์ฟเวอร์ที่รองรับ credential นั้นแล้ว
+
+### 18.1 สมมติฐานที่ยืนยันแล้ว: `payload = plaintext XOR keystream K`
+
+ข้อเท็จจริงที่พิสูจน์ได้แล้ว (ไม่ใช่เดา):
+
+1. payload ที่ client ส่งมา **ยาวเท่ากันทุกครั้ง = 621 ไบต์** (40/40 captures,
+   หัวเฟรม `u16 LE` = 623 รวมหัว) → เป็น struct คงที่ ไม่ใช่ payload ยาวผันผวน
+2. payload นี้ **ถอดไม่ออกด้วย cipher 4 โหมดของ DLL** และไม่ใช่ table cipher 5,679 รายการ
+   (brute-force state ครบทุกตัว × ทุก DLL ใน client แล้ว)
+3. แต่ถ้า **XOR กับ keystream K ที่คงที่** → ได้ plaintext ที่อ่านออกทันที
+   (บัญชี + hash รหัสผ่าน) → แปลว่า client เข้ารหัสที่ **ชั้นแอป** ด้วย keystream
+   ที่ตัวเองหาได้จาก handshake ไม่ใช่ cipher ใน DLL
+4. K เป็น **ฟังก์ชันของค่า A/B ใน handshake** (ดู 18.2) → เป็นการเข้ารหัสชั้น transport
+   ที่เราเพิ่งเปิดเผย ไม่ใช่การเข้ารหัสของ KFXArchive
+
+### 18.2 K ผูกกับ handshake A/B — ผลจากการทดลองควบคุม (controlled experiment)
+
+ทดลองโดยเปลี่ยน**ตัวแปรเดียว** = ค่า A/B ใน greeting ที่ server ส่ง
+(บัญชี/รหัสผ่าน/client/server คงที่) แล้ววัด K ที่ได้จาก `payload XOR plaintext`
+→ ผลใน `re\_abk.txt` (script: `tools\exp_ab_key.py`):
+
+| ค่า A/B ใน handshake | K[5:10] (5 ไบต์แรก) | K[37:69] (32 ไบต์) |
+|---|---|---|
+| `A=B=0x57` (รอบที่ 1) | `9a 02 b4 8c 02` | `0e d1 29 34 7c 4e 28 d4 5b ef …` |
+| `A=B=0xDEADBEEF` | `de 20 99 e1 07` | `9f e8 58 25 4e 5f 50 34 90 …` |
+| `A=B=0x57` (รอบที่ 2) | `9a 02 b4 8c 02` | `0e d1 29 34 7c 4e 28 d4 5b ef …` |
+
+**ข้อสรุป:**
+- เปลี่ยน A/B → K เปลี่ยนตาม → K **ผูกกับ handshake**
+- กลับมาใช้ 0x57 → K **เหมือนเดิมเป๊ะ** → K เป็นฟังก์ชัน** deterministic**
+  ของ A/B (ไม่ใช่ random ต่อ session) → ทำให้**ถอดซ้ำได้ทุกครั้ง**
+- ข้อนี้ยืนยันด้วยการทดสอบอัตโนมัติ 40 capture → ถอดได้ 35 (หัวข้อ 18.3)
+
+> ⚠️ **ข้อควรระวัง**: ค่า A/B ปกติของเราคือ `0x57` เพราะ `mix(0x57) = 0` (หัวข้อ 9.4)
+> ถ้าเปลี่ยนค่านี้ใน `config.json` ต้องกู้ K ใหม่ทุกครั้ง
+
+### 18.3 โครงสร้าง plaintext ที่กู้ได้ (48 ไบต์จาก 621)
+
+กู้ K ได้ 48 ตำแหน่ง (เก็บใน `re\keystream_621.bin` — ไฟล์ยาว 621 ไบต์ แต่เก็บค่าจริง
+เฉพาะ 37 ตำแหน่ง ที่เหลือเป็นศูนย์) คือ **ช่วงที่คุ้มที่สุด เพราะรู้ plaintext อยู่แล้ว**:
+
+| offset | ความยาว | คืออะไร | หลักฐาน |
+|---|---|---|---|
+| 5 – 20 | 16 ไบต์ | **ชื่อบัญชี** (ASCII, NUL-terminated) | ถอดแล้วอ่านออกเป็น `admin` / `zzztest99` / `0123456789ABCDEF` ตรงกับที่พิมพ์ลงเกมทุกครั้ง |
+| 37 – 68 | 32 ไบต์ | **`MD5UPPER(password)`** (ตัวอักษรใหญ่ 32 ตัว) | ตรงกับ `MD5(password).hexdigest().upper()` ของรหัสผ่านจริงทุกชุดที่ทดสอบ |
+
+> หมายเหตุ: ไบต์แรกของช่วง 37–68 ในบาง capture คือ `0x00` (ความยาวสตริง)
+> แต่ผลรวมกับบริบทชัดเจนว่าเป็น hash 32 ตัว
+
+**ผลทดสอบอัตโนมัติ** (`python tools\verify_a4_claims.py` — รันซ้ำได้ทุกครั้ง):
+
+```
+captures: 40   ความยาวเฟรมทั้งหมด = 623 (payload 621 ไบต์)
+account field (offset 5) เป็น ASCII NUL-terminated : 35/40
+  MD5 field เป็น hex32 ตัวพิมพ์ใหญ่                : 35/35
+password MD5 ตรงกับ MD5UPPER ของรหัสผ่านที่รู้        : 35/40
+plaintext XOR K == payload เดิม (byte ที่มี K)        : 40/40
+```
+
+**ทำไม 5 capture ถอดไม่ได้?** เพราะใช้ handshake ที่ A/B ≠ 0x57 → K คนละชุด
+ยืนยันได้จาก `server.log` ที่บันทึก A/B ของแต่ละรอบ:
+- 1 รอบเป็น `A=B=0xDEADBEEF` (ทดลองในหัวข้อ 18.2) → K ต่าง → ถอดไม่ออก ✔ ตรงตามคาด
+- อีก 4 รอบเป็น capture เก่าที่ log ถูกหมุนเวียนจนไม่มีค่า A/B ของรอบนั้นแล้ว
+
+**ที่ยังไม่รู้ใน plaintext**: ไบต์ 0–4 (header), 21–36, 69–620 (เกือบทั้งหมด)
+→ เป็น field อื่นของ `C2M_*` message (cookie, sign data, region, version ฯลฯ)
+
+### 18.4 REST API + ฐานข้อมูล Microsoft SQL Server + login flow (ต่อกับ game server แล้ว)
+
+ช่องทางข้อมูลตอนนี้:
+
+```
+client ──(Bishop frame :7451)──▶ game_server ──▶ LoginFlow ──(HTTP)──▶ REST API
+                                                                    │
+                                                         pymssql ─────┴────▶ Microsoft SQL Server
+                                                              168.222.28.150:54855 / ฐาน xshot
+```
+
+| ชิ้นส่วน | ไฟล์ | สถานะ |
+|---|---|---|
+| REST API (`/api/*`, 18 endpoint) | `server\xshot\api.py` | ✅ ทำงานจริง ทดสอบ CRUD ผ่านหมด |
+| ฐานข้อมูล (2 แบ็กเอนด์) | `server\xshot\db.py` | ✅ ค่าเริ่มต้น = **mssql** (ยังเลือก sqlite ได้) |
+| ตัวเรียก API จาก game server | `server\xshot\auth.py` | ✅ |
+| ถอด credential + สร้าง packet ตอบ | `server\xshot\login_protocol.py` | 🔶 ถอด credential ได้แล้ว · `ReplyBuilder` ยังว่าง |
+| ขั้นตอน login ตอนกดปุ่ม | `server\xshot\login_flow.py` | ✅ ต่อเข้ากับ game server แล้ว |
+| จุดเสียบตอบกลับ client | `game_server.py` → `_handle_bishop_frame()` | ❌ **ยังว่าง = จุดติดหลัก** |
+
+**ตารางในฐานข้อมูล** (6 ตาราง บน SQL Server): `accounts`, `characters`,
+`character_items`, `character_stats`, `login_log`, `sessions`
+
+**ผลทดสอบ** (`python server\tools\db_selftest.py` — ผ่านทั้งหมด):
+
+```
+เชื่อมต่อแล้ว      : mssql://168.222.28.150:54855/xshot
+authenticate(pwd)  : True ok
+authenticate(ผิด)  : False รหัสผ่านไม่ถูกต้อง
+create/update/delete character, item, stats, session : ผ่าน
+stats              : {'accounts': 2, 'login_success': 8, 'login_failed': 5, 'db_backend': 'mssql'}
+```
+
+บัญชีเริ่มต้นที่ seed ให้: `admin` / `admin123` (ตัวละคร `Newbie`)
+ปรับได้ใน `server\config.json` หัวข้อ `db.seed_*`
+
+### 18.5 ยังติดอะไร + ทำต่ออย่างไร
+
+**จุดติดเดียวที่เหลือของ A4**: ยัง**ตอบกลับ client ไม่ได้**
+เพราะยังไม่รู้ message id / โครงสร้างฝั่ง server ที่ต้องตอบ (`M2C_*`, `PlayerLoginBishopResult`)
+
+| # | งาน | ที่อยู่ | ผลลัพธ์ที่ต้องการ |
+|---|---|---|---|
+| 1 | **กู้ K ครบ 621 ไบต์** | `tools\a4_kfull.py`, `tools\recover.py` | ถอด plaintext ทุก field → รู้ message layout ทั้ง packet |
+| 2 | หา message id ของ login + รูปแบบที่ server ต้องตอบ | `re\protocol_messages.txt`, `re\decrypted_all\System\KFXProtoRecieve.u` | ได้ id + field order ของ `PlayerLoginBishopResult` |
+| 3 | **เขียน `ReplyBuilder.set_impl()`** | `server\xshot\login_protocol.py` → `ReplyBuilder` | ใส่ logic ตอบ login → client เดินต่อไปหน้าเลือกเซิร์ฟเวอร์ |
+| 4 | ต่อ `game_server._handle_bishop_frame()` | `server\xshot\game_server.py` | ส่ง packet ตอบกลับจริง (ตอนนี้คืน `None`) |
+| 5 | ใส่ logic ถอด credential ที่กู้ได้ (แทน ASCII scan) | `login_protocol.decode_login()` | ถอดตรงตาม layout ที่แน่นอนแล้ว ไม่ต้องเดา |
+
+**เส้นทางสะพานชั่วคราวระหว่างรอ**: `/api/session/claim` — เครื่องมือภายนอกยืนยัน
+credential ผ่าน API ก่อน แล้ว game server จะหยิบไปตรวจกับฐานข้อมูล
+(TTL 120 วินที) เมื่อถอด packet ได้จริง กลไกนี้จะไม่ถูกใช้อีก
+
+**ข้อดีของสถานะนี้**: แม้ยังตอบ client ไม่ได้ แต่ "ฝั่งเซิร์ฟเวอร์" ของ login
+(บัญชี/ตัวละคร/ของ/สถิติ/session/log) **พร้อมใช้งานจริงแล้วและผ่านการทดสอบ**
+→ พอรู้รูปแบบ `M2C` เมื่อไร ก็ต่อได้ทันทีโดยไม่ต้องรื้อฝั่งฐานข้อมูลอีก

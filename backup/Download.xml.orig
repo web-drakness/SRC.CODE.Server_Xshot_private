@@ -1,0 +1,52 @@
+<KingsoftDownload>
+<DownloadItem lf="h:\hack\client_xshot\update\update142-143.exe" segCnt="4" dt="1792851365">
+<URL>http://patchxshot.winwin.co.th/synchVS/autoupdate/update142-143.exe</URL>
+<FileSize>77597104</FileSize>
+<Segments>
+<SegmentItem i="0" isp="0" sp="3157987" ep="19399275"/>
+<SegmentItem i="1" isp="19399276" sp="22561456" ep="38798551"/>
+<SegmentItem i="2" isp="38798552" sp="41966332" ep="58197827"/>
+<SegmentItem i="3" isp="58197828" sp="61357208" ep="77597103"/>
+</Segments>
+</DownloadItem>
+<DownloadItem lf="h:\xshot\client_xshot\update\update142-143.exe" segCnt="4" dt="1792851581">
+<URL>http://patchxshot.winwin.co.th/synchVS/autoupdate/update142-143.exe</URL>
+<FileSize>77597104</FileSize>
+<Segments>
+<SegmentItem i="0" isp="0" sp="19399276" ep="19399275"/>
+<SegmentItem i="1" isp="19399276" sp="38798552" ep="38798551"/>
+<SegmentItem i="2" isp="38798552" sp="58197828" ep="58197827"/>
+<SegmentItem i="3" isp="58197828" sp="77597104" ep="77597103"/>
+</Segments>
+</DownloadItem>
+<DownloadItem lf="h:\xshot\client_xshot\update\update143-144.exe" segCnt="4" dt="1792851650">
+<URL>http://patchxshot.winwin.co.th/synchVS/autoupdate/update143-144.exe</URL>
+<FileSize>64977264</FileSize>
+<Segments>
+<SegmentItem i="0" isp="0" sp="16244316" ep="16244315"/>
+<SegmentItem i="1" isp="16244316" sp="32488632" ep="32488631"/>
+<SegmentItem i="2" isp="32488632" sp="48732948" ep="48732947"/>
+<SegmentItem i="3" isp="48732948" sp="64977264" ep="64977263"/>
+</Segments>
+</DownloadItem>
+<DownloadItem lf="h:\xshot\client_xshot\update\update144-145.exe" segCnt="4" dt="1792851696">
+<URL>http://patchxshot.winwin.co.th/synchVS/autoupdate/update144-145.exe</URL>
+<FileSize>24572176</FileSize>
+<Segments>
+<SegmentItem i="0" isp="0" sp="6143044" ep="6143043"/>
+<SegmentItem i="1" isp="6143044" sp="12286088" ep="12286087"/>
+<SegmentItem i="2" isp="12286088" sp="18429132" ep="18429131"/>
+<SegmentItem i="3" isp="18429132" sp="24572176" ep="24572175"/>
+</Segments>
+</DownloadItem>
+<DownloadItem lf="h:\hack\client_xshot\update\update141-142.exe" segCnt="4" dt="1792851353">
+<URL>http://patchxshot.winwin.co.th/synchVS/autoupdate/update141-142.exe</URL>
+<FileSize>24510600</FileSize>
+<Segments>
+<SegmentItem i="0" isp="0" sp="6127650" ep="6127649"/>
+<SegmentItem i="1" isp="6127650" sp="12255300" ep="12255299"/>
+<SegmentItem i="2" isp="12255300" sp="18382950" ep="18382949"/>
+<SegmentItem i="3" isp="18382950" sp="24510600" ep="24510599"/>
+</Segments>
+</DownloadItem>
+</KingsoftDownload>
